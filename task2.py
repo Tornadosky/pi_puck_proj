@@ -20,7 +20,7 @@ POSITION_TOPIC = "robot_pos/all"
 ROBOT_ID = "33"
 OWN_TOPIC = "robot/{}".format(ROBOT_ID)
 
-COMMUNICATION_RADIUS = 0.50      # 50 cm, as requested in Task 2
+COMMUNICATION_RADIUS = 0.30      # 50 cm, as requested in Task 2
 PROXIMITY_CHECK_INTERVAL = 2.0    # check nearby robots every few seconds
 HELLO_COOLDOWN_SECONDS = 8.0      # avoid spamming the same robot
 
@@ -46,14 +46,14 @@ TARGET_Y_MAX = 0.80
 BOUNDARY_MARGIN = 0.16
 
 # Close collision avoidance. This is smaller than communication radius.
-ROBOT_AVOID_DISTANCE = 0.22
+ROBOT_AVOID_DISTANCE = 0.15
 
 # Change/delete this if your forbidden zone is different.
 FORBIDDEN_ZONES = [
     ("top_left_forbidden", 0.00, 0.25, 0.75, 1.00),
 ]
 
-FORWARD_SPEED = 260
+FORWARD_SPEED = 340
 AVOID_SPEED = 210
 TURN_LIMIT = 170
 MAX_SPEED = 330
@@ -552,4 +552,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PY
