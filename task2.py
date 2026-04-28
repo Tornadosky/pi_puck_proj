@@ -20,18 +20,17 @@ POSITION_TOPIC = "robot_pos/all"
 ROBOT_ID = "33"
 OWN_TOPIC = "robot/{}".format(ROBOT_ID)
 
+# Task 2 communication distance. This is separate from collision avoidance.
 COMMUNICATION_RADIUS = 0.50
 PROXIMITY_CHECK_INTERVAL = 2.0
 HELLO_COOLDOWN_SECONDS = 8.0
 
 LOG_FILE = "task2_messages.log"
-
-# Longer LED blinking after receiving "Hello"
 BLINK_DURATION_SECONDS = 7.0
 
 
 # ============================================================
-# ARENA / SAFETY CONFIG
+# ARENA / DANGER CONFIG
 # ============================================================
 
 ARENA_X_MIN = 0.05
@@ -39,68 +38,58 @@ ARENA_X_MAX = 1.95
 ARENA_Y_MIN = 0.05
 ARENA_Y_MAX = 0.95
 
-# Normal random movement can use most of the arena,
-# but targets are kept away from the very edge.
-TARGET_X_MIN = 0.20
-TARGET_X_MAX = 1.80
-TARGET_Y_MIN = 0.14
-TARGET_Y_MAX = 0.86
+# Less sensitive than before: no lookahead / predicted boundary.
+BOUNDARY_MARGIN = 0.13
+BOUNDARY_CRITICAL_MARGIN = 0.08
 
-# Earlier boundary avoidance.
-# Warning = start preparing to escape.
-# Emergency = stop confident movement and pivot/escape carefully.
-BOUNDARY_WARN = 0.28
-BOUNDARY_EMERGENCY = 0.13
-
-# Forbidden zone avoidance.
-# The robot should avoid the inflated forbidden zone, not only the real one.
 FORBIDDEN_ZONES = [
     # name, x_min, x_max, y_min, y_max
     ("top_left_forbidden", 0.00, 0.25, 0.75, 1.00),
 ]
 
-FORBIDDEN_WARN_BUFFER = 0.18
-FORBIDDEN_EMERGENCY_BUFFER = 0.04
+# Small buffer only, so it avoids forbidden zones but does not obsess.
+FORBIDDEN_BUFFER = 0.07
 
-# More active robot collision avoidance.
-ROBOT_WARN_DISTANCE = 0.18
-ROBOT_EMERGENCY_DISTANCE = 0.23
+# Robot collision avoidance threshold. Not huge.
+ROBOT_AVOID_DISTANCE = 0.20
+ROBOT_CRITICAL_DISTANCE = 0.15
 
-# Look ahead in the current movement direction.
-# This is what prevents entering forbidden zones in the first place.
-LOOKAHEAD_DISTANCES = [0.12, 0.22, 0.34, 0.46]
+TARGET_X_MIN = 0.18
+TARGET_X_MAX = 1.82
+TARGET_Y_MIN = 0.12
+TARGET_Y_MAX = 0.88
 
 
 # ============================================================
 # MOVEMENT CONFIG
 # ============================================================
 
-# Keep the confident movement you liked.
+# Confident normal movement.
 CRUISE_SPEED = 410
 MAX_SPEED = 520
 
-# Normal movement is mostly straight.
 STRAIGHT_MIN_TIME = 7.0
 STRAIGHT_MAX_TIME = 14.0
 CURVE_MIN_TIME = 2.0
 CURVE_MAX_TIME = 4.5
 
-# Safety movement is slower and more controlled.
-SAFETY_SPEED = 300
-EMERGENCY_ESCAPE_SPEED = 260
-SAFETY_MIN_FORWARD_SPEED = 90
+# Avoidance: maybe back up, turn, then escape forward.
+BACK_SPEED = 190
+BACK_TIME = 0.35
 
-SAFETY_TURN_GAIN = 175.0
-SAFETY_TURN_LIMIT = 145
+TURN_SPEED = 175
+TURN_TIME = 0.50
 
-# Pivot speed is used only when danger is high or the required correction is large.
-PIVOT_SPEED = 185
-WARNING_PIVOT_SPEED = 150
+ESCAPE_SPEED = 320
+ESCAPE_TIME = 1.15
+
+ESCAPE_TURN_GAIN = 160.0
+ESCAPE_TURN_LIMIT = 120
+ESCAPE_MIN_FORWARD_SPEED = 110
 
 CONTROL_PERIOD = 0.10
 
-# Tracking angle from your logs looked like degrees.
-# If avoidance turns the wrong way, change TURN_SIGN to -1.
+# If avoidance turns the wrong way, change this to -1.
 ANGLE_SIGN = -1
 HEADING_OFFSET_DEG = 95.0
 TURN_SIGN = 1
@@ -119,9 +108,14 @@ drive_mode_until = 0.0
 motion_history = []
 motion_heading = None
 motion_heading_time = 0.0
+last_motor_cmd = (0, 0)
 
-unstick_until = 0.0
-unstick_dir = 1
+avoid_phase = "idle"
+avoid_until = 0.0
+avoid_target = None
+avoid_reason = ""
+avoid_turn_dir = 1
+avoid_started_at = 0.0
 
 last_hello_sent = {}
 next_proximity_check = 0.0
@@ -153,11 +147,6 @@ def norm_angle(a):
 
 def robot_key(rid):
     return str(rid).replace("pi-puck", "").replace("robot", "").strip()
-
-
-def add_reason(reasons, reason):
-    if reason not in reasons:
-        reasons.append(reason)
 
 
 def raw_angle_to_rad(raw_angle):
@@ -255,7 +244,7 @@ def log_line(text):
 
 
 # ============================================================
-# HEADING / MOTION ESTIMATE
+# HEADING ESTIMATE
 # ============================================================
 
 def camera_heading(pose):
@@ -266,10 +255,13 @@ def camera_heading(pose):
 
 def current_heading(pose):
     """
-    Prefer the actual movement direction from position updates.
-    If that is stale, fall back to camera marker angle.
+    Prefer real movement direction only when the previous command was forward.
+    This avoids treating backwards movement as the robot's forward heading.
     """
-    if motion_heading is not None and time.time() - motion_heading_time < 2.0:
+    left, right = last_motor_cmd
+    previous_cmd_was_forward = left > 100 and right > 100
+
+    if previous_cmd_was_forward and motion_heading is not None and time.time() - motion_heading_time < 2.0:
         return motion_heading
 
     return camera_heading(pose)
@@ -285,14 +277,16 @@ def update_motion_estimate(pose):
     x, y, _angle = pose
 
     motion_history.append((now, x, y))
-
-    # Keep about 6 seconds of history.
     motion_history = [p for p in motion_history if now - p[0] <= 6.0]
 
     if len(motion_history) < 2:
         return
 
-    old_t, old_x, old_y = motion_history[-2]
+    left, right = last_motor_cmd
+    if not (left > 100 and right > 100):
+        return
+
+    _old_t, old_x, old_y = motion_history[-2]
     dx = x - old_x
     dy = y - old_y
     d = math.sqrt(dx * dx + dy * dy)
@@ -310,26 +304,8 @@ def update_motion_estimate(pose):
         motion_heading_time = now
 
 
-def moved_recently_enough():
-    if len(motion_history) < 2:
-        return True
-
-    now = time.time()
-    old_samples = [p for p in motion_history if now - p[0] >= 3.5]
-
-    if not old_samples:
-        return True
-
-    old_t, old_x, old_y = old_samples[0]
-    new_t, new_x, new_y = motion_history[-1]
-
-    moved = math.sqrt((new_x - old_x) ** 2 + (new_y - old_y) ** 2)
-
-    return moved >= 0.05
-
-
 # ============================================================
-# FORBIDDEN ZONE / SAFETY HELPERS
+# DANGER DETECTION
 # ============================================================
 
 def point_inside_zone(x, y, zone, buffer_amount):
@@ -351,10 +327,10 @@ def point_inside_any_forbidden(x, y, buffer_amount):
 
 def zone_center(zone):
     _name, x_min, x_max, y_min, y_max = zone
-    return (0.5 * (x_min + x_max), 0.5 * (y_min + y_max))
+    return 0.5 * (x_min + x_max), 0.5 * (y_min + y_max)
 
 
-def add_vector(vec, dx, dy, weight):
+def add_unit_vector(vec, dx, dy, weight):
     length = math.sqrt(dx * dx + dy * dy)
 
     if length < 0.0001:
@@ -364,125 +340,82 @@ def add_vector(vec, dx, dy, weight):
     vec[1] += weight * dy / length
 
 
-def add_forbidden_repulsion(vec, px, py, zone, weight):
-    cx, cy = zone_center(zone)
-
-    dx = px - cx
-    dy = py - cy
-
-    # If exactly in the middle, escape toward arena center.
-    if abs(dx) < 0.001 and abs(dy) < 0.001:
-        dx = 1.00 - cx
-        dy = 0.50 - cy
-
-    add_vector(vec, dx, dy, weight)
-
-
-def apply_wall_repulsion(vec, px, py, weight, reasons, prefix):
-    triggered = False
-
-    if px < ARENA_X_MIN + BOUNDARY_WARN:
-        strength = (ARENA_X_MIN + BOUNDARY_WARN - px) / BOUNDARY_WARN
-        vec[0] += weight * strength
-        triggered = True
-
-    if px > ARENA_X_MAX - BOUNDARY_WARN:
-        strength = (px - (ARENA_X_MAX - BOUNDARY_WARN)) / BOUNDARY_WARN
-        vec[0] -= weight * strength
-        triggered = True
-
-    if py < ARENA_Y_MIN + BOUNDARY_WARN:
-        strength = (ARENA_Y_MIN + BOUNDARY_WARN - py) / BOUNDARY_WARN
-        vec[1] += weight * strength
-        triggered = True
-
-    if py > ARENA_Y_MAX - BOUNDARY_WARN:
-        strength = (py - (ARENA_Y_MAX - BOUNDARY_WARN)) / BOUNDARY_WARN
-        vec[1] -= weight * strength
-        triggered = True
-
-    if triggered:
-        add_reason(reasons, prefix + "boundary")
-
-
-def ensure_safe_target(tx, ty):
+def clamp_safe_target(tx, ty):
     tx = clamp(tx, TARGET_X_MIN, TARGET_X_MAX)
     ty = clamp(ty, TARGET_Y_MIN, TARGET_Y_MAX)
 
-    # If target is still too close to forbidden zone, use arena center.
-    if point_inside_any_forbidden(tx, ty, FORBIDDEN_WARN_BUFFER):
+    if point_inside_any_forbidden(tx, ty, FORBIDDEN_BUFFER):
         tx, ty = 1.00, 0.50
 
     return tx, ty
 
 
-def compute_safety_target(pose):
+def detect_danger(pose):
     """
-    Returns:
-      target, reason, severity
-
-    severity:
-      0 = no danger
-      1 = warning / predicted danger
-      2 = emergency / already very close or inside
+    Moderate sensitivity:
+      - no predicted-boundary lookahead
+      - small forbidden-zone buffer
+      - small robot collision threshold
     """
     x, y, _angle = pose
-
     vec = [0.0, 0.0]
     reasons = []
-    severity = 0
+    critical = False
 
-    heading = current_heading(pose)
+    # Boundary danger.
+    if x < ARENA_X_MIN + BOUNDARY_MARGIN:
+        strength = (ARENA_X_MIN + BOUNDARY_MARGIN - x) / BOUNDARY_MARGIN
+        vec[0] += 2.0 * strength
+        reasons.append("left boundary")
+        if x < ARENA_X_MIN + BOUNDARY_CRITICAL_MARGIN:
+            critical = True
 
-    # Current boundary danger.
-    apply_wall_repulsion(vec, x, y, 2.5, reasons, "near ")
+    if x > ARENA_X_MAX - BOUNDARY_MARGIN:
+        strength = (x - (ARENA_X_MAX - BOUNDARY_MARGIN)) / BOUNDARY_MARGIN
+        vec[0] -= 2.0 * strength
+        reasons.append("right boundary")
+        if x > ARENA_X_MAX - BOUNDARY_CRITICAL_MARGIN:
+            critical = True
 
-    if (
-        x < ARENA_X_MIN + BOUNDARY_EMERGENCY or
-        x > ARENA_X_MAX - BOUNDARY_EMERGENCY or
-        y < ARENA_Y_MIN + BOUNDARY_EMERGENCY or
-        y > ARENA_Y_MAX - BOUNDARY_EMERGENCY
-    ):
-        severity = max(severity, 2)
-        add_reason(reasons, "emergency boundary")
-    elif reasons:
-        severity = max(severity, 1)
+    if y < ARENA_Y_MIN + BOUNDARY_MARGIN:
+        strength = (ARENA_Y_MIN + BOUNDARY_MARGIN - y) / BOUNDARY_MARGIN
+        vec[1] += 2.0 * strength
+        reasons.append("bottom boundary")
+        if y < ARENA_Y_MIN + BOUNDARY_CRITICAL_MARGIN:
+            critical = True
 
-    # Predict future boundary danger.
-    for d in LOOKAHEAD_DISTANCES:
-        px = x + d * math.cos(heading)
-        py = y + d * math.sin(heading)
+    if y > ARENA_Y_MAX - BOUNDARY_MARGIN:
+        strength = (y - (ARENA_Y_MAX - BOUNDARY_MARGIN)) / BOUNDARY_MARGIN
+        vec[1] -= 2.0 * strength
+        reasons.append("top boundary")
+        if y > ARENA_Y_MAX - BOUNDARY_CRITICAL_MARGIN:
+            critical = True
 
-        before = len(reasons)
-        apply_wall_repulsion(vec, px, py, 1.6, reasons, "predicted ")
-
-        if len(reasons) > before:
-            severity = max(severity, 1)
-
-    # Current and predicted forbidden-zone danger.
+    # Forbidden-zone danger.
     for zone in FORBIDDEN_ZONES:
         name = zone[0]
+        zcx, zcy = zone_center(zone)
 
-        if point_inside_zone(x, y, zone, FORBIDDEN_EMERGENCY_BUFFER):
-            add_forbidden_repulsion(vec, x, y, zone, 6.0)
-            add_reason(reasons, "emergency forbidden zone: " + name)
-            severity = max(severity, 2)
+        if point_inside_zone(x, y, zone, 0.0):
+            dx = x - zcx
+            dy = y - zcy
 
-        elif point_inside_zone(x, y, zone, FORBIDDEN_WARN_BUFFER):
-            add_forbidden_repulsion(vec, x, y, zone, 4.0)
-            add_reason(reasons, "near forbidden zone: " + name)
-            severity = max(severity, 1)
+            if abs(dx) < 0.001 and abs(dy) < 0.001:
+                dx = 1.0 - x
+                dy = 0.5 - y
 
-        for d in LOOKAHEAD_DISTANCES:
-            px = x + d * math.cos(heading)
-            py = y + d * math.sin(heading)
+            add_unit_vector(vec, dx, dy, 3.5)
+            reasons.append("inside forbidden zone: " + name)
+            critical = True
 
-            if point_inside_zone(px, py, zone, FORBIDDEN_WARN_BUFFER):
-                add_forbidden_repulsion(vec, px, py, zone, 3.5)
-                add_reason(reasons, "predicted forbidden zone: " + name)
-                severity = max(severity, 1)
+        elif point_inside_zone(x, y, zone, FORBIDDEN_BUFFER):
+            dx = x - zcx
+            dy = y - zcy
 
-    # Robot collision avoidance.
+            add_unit_vector(vec, dx, dy, 2.3)
+            reasons.append("near forbidden zone: " + name)
+
+    # Robot collision danger.
     closest_id = None
     closest_pose = None
     closest_d = None
@@ -498,38 +431,43 @@ def compute_safety_target(pose):
             closest_pose = other
             closest_d = d
 
-    if closest_pose is not None and closest_d is not None:
-        if 0.001 < closest_d < ROBOT_WARN_DISTANCE:
-            ox, oy, _ = closest_pose
-            dx = x - ox
-            dy = y - oy
+    if closest_pose is not None and closest_d is not None and 0.001 < closest_d < ROBOT_AVOID_DISTANCE:
+        dx = x - closest_pose[0]
+        dy = y - closest_pose[1]
 
-            if closest_d < ROBOT_EMERGENCY_DISTANCE:
-                weight = 5.0
-                severity = max(severity, 2)
-                add_reason(reasons, "emergency robot {} at {:.2f}m".format(closest_id, closest_d))
-            else:
-                weight = 3.2
-                severity = max(severity, 1)
-                add_reason(reasons, "near robot {} at {:.2f}m".format(closest_id, closest_d))
+        strength = 2.2 + (ROBOT_AVOID_DISTANCE - closest_d) / ROBOT_AVOID_DISTANCE
+        add_unit_vector(vec, dx, dy, strength)
 
-            add_vector(vec, dx, dy, weight)
+        reasons.append("robot {} at {:.2f}m".format(closest_id, closest_d))
+
+        if closest_d < ROBOT_CRITICAL_DISTANCE:
+            critical = True
 
     mag = math.sqrt(vec[0] * vec[0] + vec[1] * vec[1])
 
-    if severity == 0 or mag < 0.001:
-        return None, "clear", 0
+    if mag < 0.001:
+        return None
 
-    # Choose a target in the safe direction.
-    # Emergency target is a bit farther so it commits to escaping.
-    escape_distance = 0.65 if severity >= 2 else 0.48
+    escape_distance = 0.58 if critical else 0.42
 
     tx = x + escape_distance * vec[0] / mag
     ty = y + escape_distance * vec[1] / mag
+    tx, ty = clamp_safe_target(tx, ty)
 
-    tx, ty = ensure_safe_target(tx, ty)
+    # Backup only helps if robot is facing toward danger.
+    heading = current_heading(pose)
+    safe_x = vec[0] / mag
+    safe_y = vec[1] / mag
 
-    return (tx, ty), ", ".join(reasons), severity
+    heading_dot_safe = math.cos(heading) * safe_x + math.sin(heading) * safe_y
+    should_backup = heading_dot_safe < -0.10
+
+    return {
+        "target": (tx, ty),
+        "reason": ", ".join(reasons),
+        "critical": critical,
+        "should_backup": should_backup,
+    }
 
 
 # ============================================================
@@ -542,11 +480,11 @@ def choose_new_drive_mode():
     r = random.random()
     now = time.time()
 
-    if r < 0.82:
+    if r < 0.80:
         drive_mode = "straight"
         drive_mode_until = now + random.uniform(STRAIGHT_MIN_TIME, STRAIGHT_MAX_TIME)
 
-    elif r < 0.91:
+    elif r < 0.90:
         drive_mode = "curve_left"
         drive_mode_until = now + random.uniform(CURVE_MIN_TIME, CURVE_MAX_TIME)
 
@@ -560,95 +498,149 @@ def free_drive_command():
         choose_new_drive_mode()
 
     if drive_mode == "straight":
-        return CRUISE_SPEED, CRUISE_SPEED, "confident straight"
+        return CRUISE_SPEED, CRUISE_SPEED, "confident straight", None, None
 
     if drive_mode == "curve_left":
-        return CRUISE_SPEED - 75, CRUISE_SPEED + 25, "confident gentle curve left"
+        return CRUISE_SPEED - 80, CRUISE_SPEED + 25, "confident gentle curve left", None, None
 
     if drive_mode == "curve_right":
-        return CRUISE_SPEED + 25, CRUISE_SPEED - 75, "confident gentle curve right"
+        return CRUISE_SPEED + 25, CRUISE_SPEED - 80, "confident gentle curve right", None, None
 
-    return CRUISE_SPEED, CRUISE_SPEED, "confident straight"
+    return CRUISE_SPEED, CRUISE_SPEED, "confident straight", None, None
 
 
-def steer_safety(pose, target, severity):
+def steer_to_target_forward(pose, target):
     x, y, _angle = pose
     tx, ty = target
 
     desired_heading = math.atan2(ty - y, tx - x)
     heading = current_heading(pose)
-
     error = norm_angle(desired_heading - heading)
-    abs_error = abs(error)
 
-    # Important: in danger, do not make a huge forward curve.
-    # Pivot first, then escape straight-ish.
-    if severity >= 2 and abs_error > math.radians(32):
-        turn = PIVOT_SPEED if error > 0 else -PIVOT_SPEED
-        turn *= TURN_SIGN
+    turn = TURN_SIGN * int(clamp(ESCAPE_TURN_GAIN * error, -ESCAPE_TURN_LIMIT, ESCAPE_TURN_LIMIT))
 
-        return -turn, turn, math.degrees(error), "emergency pivot"
+    left = int(clamp(ESCAPE_SPEED - turn, ESCAPE_MIN_FORWARD_SPEED, MAX_SPEED))
+    right = int(clamp(ESCAPE_SPEED + turn, ESCAPE_MIN_FORWARD_SPEED, MAX_SPEED))
 
-    if severity == 1 and abs_error > math.radians(78):
-        turn = WARNING_PIVOT_SPEED if error > 0 else -WARNING_PIVOT_SPEED
-        turn *= TURN_SIGN
-
-        return -turn, turn, math.degrees(error), "warning pre-turn"
-
-    speed = EMERGENCY_ESCAPE_SPEED if severity >= 2 else SAFETY_SPEED
-
-    turn = TURN_SIGN * int(clamp(SAFETY_TURN_GAIN * error, -SAFETY_TURN_LIMIT, SAFETY_TURN_LIMIT))
-
-    left = int(clamp(speed - turn, SAFETY_MIN_FORWARD_SPEED, MAX_SPEED))
-    right = int(clamp(speed + turn, SAFETY_MIN_FORWARD_SPEED, MAX_SPEED))
-
-    return left, right, math.degrees(error), "controlled escape"
+    return left, right, math.degrees(error)
 
 
-def maybe_start_unstick():
-    global unstick_until, unstick_dir
+def set_avoid_turn_or_escape(pose):
+    global avoid_phase, avoid_until, avoid_turn_dir
 
-    if time.time() < unstick_until:
+    if avoid_target is None:
+        avoid_phase = "idle"
         return
 
-    if moved_recently_enough():
-        return
+    x, y, _angle = pose
+    tx, ty = avoid_target
 
-    unstick_dir = random.choice([-1, 1])
-    unstick_until = time.time() + 1.4
+    desired_heading = math.atan2(ty - y, tx - x)
+    error = norm_angle(desired_heading - current_heading(pose))
+
+    if abs(error) < math.radians(45):
+        avoid_phase = "escape"
+        avoid_until = time.time() + ESCAPE_TIME
+    else:
+        avoid_turn_dir = 1 if error > 0 else -1
+        avoid_phase = "turn"
+        avoid_until = time.time() + TURN_TIME
 
 
-def unstick_command():
-    # Forward curve, not spin.
-    if unstick_dir > 0:
-        return CRUISE_SPEED - 140, CRUISE_SPEED + 55, "unstick forward curve left"
+def start_avoidance(pose, danger):
+    global avoid_phase, avoid_until, avoid_target, avoid_reason, avoid_started_at
 
-    return CRUISE_SPEED + 55, CRUISE_SPEED - 140, "unstick forward curve right"
+    avoid_started_at = time.time()
+    avoid_target = danger["target"]
+    avoid_reason = danger["reason"]
+
+    if danger["should_backup"]:
+        avoid_phase = "back"
+        avoid_until = time.time() + BACK_TIME
+    else:
+        set_avoid_turn_or_escape(pose)
+
+
+def avoidance_command(pose):
+    global avoid_phase, avoid_until
+
+    now = time.time()
+
+    if avoid_phase == "idle":
+        return None
+
+    # Never stay in avoidance forever.
+    if now - avoid_started_at > 4.0:
+        avoid_phase = "idle"
+        choose_new_drive_mode()
+        return None
+
+    if avoid_phase == "back":
+        if now >= avoid_until:
+            set_avoid_turn_or_escape(pose)
+        else:
+            return -BACK_SPEED, -BACK_SPEED, "avoid backup: " + avoid_reason, avoid_target, None
+
+    if avoid_phase == "turn":
+        if avoid_target is None:
+            avoid_phase = "idle"
+            return None
+
+        tx, ty = avoid_target
+        desired_heading = math.atan2(ty - pose[1], tx - pose[0])
+        error = norm_angle(desired_heading - current_heading(pose))
+
+        if now >= avoid_until or abs(error) < math.radians(38):
+            avoid_phase = "escape"
+            avoid_until = now + ESCAPE_TIME
+        else:
+            signed_turn = TURN_SIGN * avoid_turn_dir * TURN_SPEED
+            return -signed_turn, signed_turn, "avoid turn: " + avoid_reason, avoid_target, math.degrees(error)
+
+    if avoid_phase == "escape":
+        if avoid_target is None:
+            avoid_phase = "idle"
+            return None
+
+        left, right, err = steer_to_target_forward(pose, avoid_target)
+
+        if now >= avoid_until:
+            danger = detect_danger(pose)
+
+            if danger is not None:
+                start_avoidance(pose, danger)
+                return avoidance_command(pose)
+
+            avoid_phase = "idle"
+            choose_new_drive_mode()
+            return None
+
+        return left, right, "avoid escape: " + avoid_reason, avoid_target, err
+
+    avoid_phase = "idle"
+    return None
 
 
 def choose_movement_command():
     pose = get_my_pose()
 
     if pose is None:
-        return 0, 0, "waiting for own position", None, None, 0
+        return 0, 0, "waiting for own position", None, None
 
-    safety_target, safety_reason, severity = compute_safety_target(pose)
+    cmd = avoidance_command(pose)
+    if cmd is not None:
+        return cmd
 
-    if safety_target is not None:
-        left, right, err, steering_mode = steer_safety(pose, safety_target, severity)
+    danger = detect_danger(pose)
 
-        reason = "{}; {}".format(steering_mode, safety_reason)
+    if danger is not None:
+        start_avoidance(pose, danger)
 
-        return left, right, reason, safety_target, err, severity
+        cmd = avoidance_command(pose)
+        if cmd is not None:
+            return cmd
 
-    maybe_start_unstick()
-
-    if time.time() < unstick_until:
-        left, right, reason = unstick_command()
-        return left, right, reason, None, None, 0
-
-    left, right, reason = free_drive_command()
-    return left, right, reason, None, None, 0
+    return free_drive_command()
 
 
 # ============================================================
@@ -781,21 +773,21 @@ def on_message(client, userdata, msg):
 # ============================================================
 
 def main():
-    global last_print
+    global last_print, last_motor_cmd
 
-    print("Task 2 confident-safe: confident random walk + earlier collision/zone avoidance")
+    print("Task 2 final: confident movement + moderate backup-based avoidance")
     print("Robot ID:", ROBOT_ID)
     print("Own topic:", OWN_TOPIC)
     print("Position topic:", POSITION_TOPIC)
     print("Communication radius:", COMMUNICATION_RADIUS, "m")
+    print("Collision avoid distance:", ROBOT_AVOID_DISTANCE, "m")
+    print("Boundary margin:", BOUNDARY_MARGIN, "m")
+    print("Forbidden buffer:", FORBIDDEN_BUFFER, "m")
+    print("LED blink duration:", BLINK_DURATION_SECONDS, "s")
     print("Broker:", BROKER, PORT)
-    print("Forbidden warning buffer:", FORBIDDEN_WARN_BUFFER)
-    print("Boundary warning:", BOUNDARY_WARN)
-    print("Robot warning distance:", ROBOT_WARN_DISTANCE)
-    print("LED blink duration:", BLINK_DURATION_SECONDS, "seconds")
     print("If avoidance turns the wrong way, change TURN_SIGN from 1 to -1.")
 
-    client = mqtt.Client(client_id="task2_confident_safe_robot_{}".format(ROBOT_ID))
+    client = mqtt.Client(client_id="task2_final_robot_{}".format(ROBOT_ID))
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(BROKER, PORT, 60)
@@ -805,6 +797,7 @@ def main():
 
     try:
         pipuck.epuck.set_motor_speeds(0, 0)
+        last_motor_cmd = (0, 0)
         time.sleep(0.5)
 
         choose_new_drive_mode()
@@ -813,20 +806,21 @@ def main():
             pose = get_my_pose()
             update_motion_estimate(pose)
 
-            left, right, reason, target, err, severity = choose_movement_command()
+            left, right, reason, target, err = choose_movement_command()
             pipuck.epuck.set_motor_speeds(left, right)
+            last_motor_cmd = (left, right)
 
             send_hello_to_close_robots(client)
             update_leds(pipuck)
 
             now = time.time()
 
-            if now - last_print > 1.2:
+            if now - last_print > 1.5:
                 print(
-                    "cmd=({}, {}) severity={} reason={} pose={} target={} err={} sent={} received={} ids={}".format(
+                    "cmd=({}, {}) phase={} reason={} pose={} target={} err={} sent={} received={} ids={}".format(
                         left,
                         right,
-                        severity,
+                        avoid_phase,
                         reason,
                         pose,
                         target,
