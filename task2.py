@@ -1,3 +1,5 @@
+cd ~/pi_puck_proj
+cat > task2_confident.py <<'PY'
 #!/usr/bin/env python3
 import json
 import math
@@ -20,51 +22,67 @@ POSITION_TOPIC = "robot_pos/all"
 ROBOT_ID = "33"
 OWN_TOPIC = "robot/{}".format(ROBOT_ID)
 
-COMMUNICATION_RADIUS = 0.30      # 50 cm, as requested in Task 2
-PROXIMITY_CHECK_INTERVAL = 2.0    # check nearby robots every few seconds
-HELLO_COOLDOWN_SECONDS = 8.0      # avoid spamming the same robot
+# Task says e.g. 50 cm. Reduce to 0.30 if it spams too much.
+COMMUNICATION_RADIUS = 0.50
+PROXIMITY_CHECK_INTERVAL = 2.0
+HELLO_COOLDOWN_SECONDS = 8.0
 
 LOG_FILE = "task2_messages.log"
 
 
 # ============================================================
-# TASK 1 MOVEMENT CONFIG
+# CONFIDENT MOVEMENT CONFIG
 # ============================================================
 
-# Overall arena limits for robot center.
 ARENA_X_MIN = 0.05
 ARENA_X_MAX = 1.95
 ARENA_Y_MIN = 0.05
 ARENA_Y_MAX = 0.95
 
-# Random targets are chosen away from the boundary.
-TARGET_X_MIN = 0.35
-TARGET_X_MAX = 1.65
-TARGET_Y_MIN = 0.20
-TARGET_Y_MAX = 0.80
+# It starts avoiding when it is this close to the boundary.
+BOUNDARY_MARGIN = 0.18
 
-BOUNDARY_MARGIN = 0.16
+# Wider target range than before, so it explores more of the arena.
+TARGET_X_MIN = 0.18
+TARGET_X_MAX = 1.82
+TARGET_Y_MIN = 0.12
+TARGET_Y_MAX = 0.88
 
-# Close collision avoidance. This is smaller than communication radius.
-ROBOT_AVOID_DISTANCE = 0.15
+# Collision avoidance is separate from communication.
+ROBOT_AVOID_DISTANCE = 0.18
 
-# Change/delete this if your forbidden zone is different.
+# Change this if the forbidden zone is different.
 FORBIDDEN_ZONES = [
     ("top_left_forbidden", 0.00, 0.25, 0.75, 1.00),
 ]
 
-FORWARD_SPEED = 340
-AVOID_SPEED = 210
-TURN_LIMIT = 170
-MAX_SPEED = 330
+# Faster and more confident.
+CRUISE_SPEED = 420
+AVOID_SPEED = 340
 
-# Based on your earlier logs, the tracking angle looked like degrees.
-# If the robot turns the wrong way, change TURN_SIGN to -1.
+# No wheel should go below this during steering.
+# This is the main anti-spinning parameter.
+MIN_FORWARD_SPEED = 150
+
+MAX_SPEED = 520
+
+# Lower turn limit = less rotating, more straight movement.
+TURN_LIMIT = 90
+TURN_GAIN = 145.0
+
+# Random movement is mostly long straight lines.
+STRAIGHT_MIN_TIME = 7.0
+STRAIGHT_MAX_TIME = 14.0
+CURVE_MIN_TIME = 2.0
+CURVE_MAX_TIME = 5.0
+
+CONTROL_PERIOD = 0.10
+
+# Tracking angle from your logs looked like degrees.
+# If boundary avoidance turns the wrong way, change TURN_SIGN to -1.
 ANGLE_SIGN = -1
 HEADING_OFFSET_DEG = 95.0
 TURN_SIGN = 1
-
-CONTROL_PERIOD = 0.10
 
 
 # ============================================================
@@ -74,8 +92,15 @@ CONTROL_PERIOD = 0.10
 latest_positions = {}
 latest_raw = {}
 
-current_target = None
-target_until = 0.0
+drive_mode = "straight"
+drive_mode_until = 0.0
+
+motion_history = []
+motion_heading = None
+motion_heading_time = 0.0
+
+unstick_until = 0.0
+unstick_dir = 1
 
 last_hello_sent = {}
 next_proximity_check = 0.0
@@ -90,7 +115,7 @@ received_count = 0
 
 
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
 def clamp(v, lo, hi):
@@ -112,7 +137,6 @@ def robot_key(rid):
 def raw_angle_to_rad(raw_angle):
     raw = float(raw_angle)
 
-    # If it is already radians, keep it. Otherwise treat it as degrees.
     if abs(raw) <= 2.0 * math.pi + 0.1:
         return raw
 
@@ -120,12 +144,6 @@ def raw_angle_to_rad(raw_angle):
 
 
 def parse_pose(record):
-    """
-    Supports likely MQTT formats:
-      {"position": [x, y], "angle": a}
-      {"x": x, "y": y, "angle": a}
-      [x, y, angle]
-    """
     try:
         if isinstance(record, dict):
             if "position" in record:
@@ -165,7 +183,6 @@ def parse_positions(data):
     if not isinstance(data, dict):
         return positions
 
-    # Format: {"robots": [{"id": "33", "position": [...], "angle": ...}, ...]}
     if "robots" in data and isinstance(data["robots"], list):
         for record in data["robots"]:
             if not isinstance(record, dict):
@@ -179,7 +196,6 @@ def parse_positions(data):
 
         return positions
 
-    # Format: {"33": {"position": [...], "angle": ...}, "34": ...}
     for rid, record in data.items():
         pose = parse_pose(record)
 
@@ -199,13 +215,6 @@ def distance(p1, p2):
     return math.sqrt(dx * dx + dy * dy)
 
 
-def current_heading(pose):
-    raw_angle_rad = raw_angle_to_rad(pose[2])
-    offset = math.radians(HEADING_OFFSET_DEG)
-
-    return norm_angle(ANGLE_SIGN * raw_angle_rad + offset)
-
-
 def log_line(text):
     stamp = time.strftime("%H:%M:%S")
     line = "[{}] {}".format(stamp, text)
@@ -220,24 +229,137 @@ def log_line(text):
 
 
 # ============================================================
-# TASK 1 RANDOM WALK / AVOIDANCE
+# HEADING / MOTION ESTIMATE
 # ============================================================
 
-def choose_random_target():
-    global current_target, target_until
+def camera_heading(pose):
+    raw_angle_rad = raw_angle_to_rad(pose[2])
+    offset = math.radians(HEADING_OFFSET_DEG)
+    return norm_angle(ANGLE_SIGN * raw_angle_rad + offset)
 
-    current_target = (
-        random.uniform(TARGET_X_MIN, TARGET_X_MAX),
-        random.uniform(TARGET_Y_MIN, TARGET_Y_MAX),
-    )
 
-    # Longer straight-ish movements.
-    target_until = time.time() + random.uniform(7.0, 12.0)
+def current_heading(pose):
+    """
+    Prefer actual movement direction from position updates.
+    This is more reliable than trusting the marker angle alone.
+    """
+    if motion_heading is not None and time.time() - motion_heading_time < 2.0:
+        return motion_heading
 
+    return camera_heading(pose)
+
+
+def update_motion_estimate(pose):
+    global motion_history, motion_heading, motion_heading_time
+
+    if pose is None:
+        return
+
+    now = time.time()
+    x, y, _angle = pose
+
+    motion_history.append((now, x, y))
+
+    # Keep about 6 seconds of history.
+    motion_history = [p for p in motion_history if now - p[0] <= 6.0]
+
+    if len(motion_history) < 2:
+        return
+
+    old_t, old_x, old_y = motion_history[-2]
+    dx = x - old_x
+    dy = y - old_y
+    d = math.sqrt(dx * dx + dy * dy)
+
+    # Only update heading if the robot really moved.
+    if d > 0.006:
+        new_heading = math.atan2(dy, dx)
+
+        if motion_heading is None:
+            motion_heading = new_heading
+        else:
+            # Smooth angle.
+            sx = 0.75 * math.cos(motion_heading) + 0.25 * math.cos(new_heading)
+            sy = 0.75 * math.sin(motion_heading) + 0.25 * math.sin(new_heading)
+            motion_heading = math.atan2(sy, sx)
+
+        motion_heading_time = now
+
+
+def moved_recently_enough():
+    """
+    Detects mumbling/spinning around one place.
+    """
+    if len(motion_history) < 2:
+        return True
+
+    now = time.time()
+    old_samples = [p for p in motion_history if now - p[0] >= 3.5]
+
+    if not old_samples:
+        return True
+
+    old_t, old_x, old_y = old_samples[0]
+    new_t, new_x, new_y = motion_history[-1]
+
+    moved = math.sqrt((new_x - old_x) ** 2 + (new_y - old_y) ** 2)
+
+    # If it moved less than 5 cm in ~3.5+ seconds, it is probably mumbling.
+    return moved >= 0.05
+
+
+# ============================================================
+# MOVEMENT LOGIC
+# ============================================================
 
 def inside_zone(x, y, zone):
     _name, x_min, x_max, y_min, y_max = zone
     return x_min <= x <= x_max and y_min <= y <= y_max
+
+
+def choose_new_drive_mode():
+    """
+    Mostly long straight movement.
+    Curves happen sometimes, but no spin-in-place.
+    """
+    global drive_mode, drive_mode_until
+
+    r = random.random()
+    now = time.time()
+
+    if r < 0.78:
+        drive_mode = "straight"
+        drive_mode_until = now + random.uniform(STRAIGHT_MIN_TIME, STRAIGHT_MAX_TIME)
+
+    elif r < 0.89:
+        drive_mode = "curve_left"
+        drive_mode_until = now + random.uniform(CURVE_MIN_TIME, CURVE_MAX_TIME)
+
+    else:
+        drive_mode = "curve_right"
+        drive_mode_until = now + random.uniform(CURVE_MIN_TIME, CURVE_MAX_TIME)
+
+
+def free_drive_command():
+    """
+    Normal random walk: mostly straight, sometimes gentle curves.
+    """
+    global drive_mode
+
+    if time.time() >= drive_mode_until:
+        choose_new_drive_mode()
+
+    if drive_mode == "straight":
+        return CRUISE_SPEED, CRUISE_SPEED, "confident straight"
+
+    if drive_mode == "curve_left":
+        return CRUISE_SPEED - 90, CRUISE_SPEED + 30, "confident curve left"
+
+    if drive_mode == "curve_right":
+        return CRUISE_SPEED + 30, CRUISE_SPEED - 90, "confident curve right"
+
+    choose_new_drive_mode()
+    return CRUISE_SPEED, CRUISE_SPEED, "confident straight"
 
 
 def get_safety_target(pose):
@@ -250,68 +372,115 @@ def get_safety_target(pose):
         if inside_zone(x, y, zone):
             return (1.00, 0.50), "escape forbidden zone: " + name
 
-    # Boundary zones: target the inside of the arena.
+    # Boundary avoidance: combine x/y corrections, so corners are handled better.
+    target_x = x
+    target_y = y
+    reasons = []
+
     if x < ARENA_X_MIN + BOUNDARY_MARGIN:
-        return (0.75, clamp(y, 0.25, 0.75)), "avoid left boundary"
+        target_x = 0.80
+        reasons.append("left boundary")
 
     if x > ARENA_X_MAX - BOUNDARY_MARGIN:
-        return (1.25, clamp(y, 0.25, 0.75)), "avoid right boundary"
+        target_x = 1.20
+        reasons.append("right boundary")
 
     if y < ARENA_Y_MIN + BOUNDARY_MARGIN:
-        return (clamp(x, 0.45, 1.55), 0.45), "avoid bottom boundary"
+        target_y = 0.45
+        reasons.append("bottom boundary")
 
     if y > ARENA_Y_MAX - BOUNDARY_MARGIN:
-        return (clamp(x, 0.45, 1.55), 0.55), "avoid top boundary"
+        target_y = 0.55
+        reasons.append("top boundary")
 
-    # Collision avoidance with other robots.
+    if reasons:
+        target_x = clamp(target_x, TARGET_X_MIN, TARGET_X_MAX)
+        target_y = clamp(target_y, TARGET_Y_MIN, TARGET_Y_MAX)
+        return (target_x, target_y), "avoid " + " + ".join(reasons)
+
+    # Robot collision avoidance.
+    closest_id = None
+    closest_d = None
+    closest_pose = None
+
     for rid, other in latest_positions.items():
         if robot_key(rid) == robot_key(ROBOT_ID):
             continue
 
         d = distance(pose, other)
 
-        if 0.001 < d < ROBOT_AVOID_DISTANCE:
-            # Move away from the other robot.
-            dx = pose[0] - other[0]
-            dy = pose[1] - other[1]
+        if closest_d is None or d < closest_d:
+            closest_id = rid
+            closest_d = d
+            closest_pose = other
 
-            tx = clamp(pose[0] + 0.45 * dx / d, TARGET_X_MIN, TARGET_X_MAX)
-            ty = clamp(pose[1] + 0.45 * dy / d, TARGET_Y_MIN, TARGET_Y_MAX)
+    if closest_pose is not None and 0.001 < closest_d < ROBOT_AVOID_DISTANCE:
+        dx = pose[0] - closest_pose[0]
+        dy = pose[1] - closest_pose[1]
 
-            return (tx, ty), "avoid robot {} at {:.2f}m".format(rid, d)
+        tx = clamp(pose[0] + 0.55 * dx / closest_d, TARGET_X_MIN, TARGET_X_MAX)
+        ty = clamp(pose[1] + 0.55 * dy / closest_d, TARGET_Y_MIN, TARGET_Y_MAX)
+
+        return (tx, ty), "avoid robot {} at {:.2f}m".format(closest_id, closest_d)
 
     return None, "clear"
 
 
-def steer_to_target(pose, target, speed):
+def steer_to_target_forward_only(pose, target, speed):
+    """
+    Steering without spinning:
+    both wheels remain positive, even for large heading errors.
+    """
     x, y, _angle = pose
     tx, ty = target
 
     desired_heading = math.atan2(ty - y, tx - x)
     heading = current_heading(pose)
+
     error = norm_angle(desired_heading - heading)
 
-    # Keep some forward movement even when turning, so it does not spin in place.
+    turn = TURN_SIGN * int(clamp(TURN_GAIN * error, -TURN_LIMIT, TURN_LIMIT))
+
+    # Slightly reduce speed for huge error, but never spin in place.
     abs_error = abs(error)
 
-    if abs_error > math.radians(110):
-        base = 80
-    elif abs_error > math.radians(60):
-        base = 140
+    if abs_error > math.radians(120):
+        base = int(speed * 0.78)
+    elif abs_error > math.radians(70):
+        base = int(speed * 0.88)
     else:
         base = speed
 
-    turn = TURN_SIGN * int(clamp(250.0 * error, -TURN_LIMIT, TURN_LIMIT))
-
-    left = int(clamp(base - turn, -MAX_SPEED, MAX_SPEED))
-    right = int(clamp(base + turn, -MAX_SPEED, MAX_SPEED))
+    left = int(clamp(base - turn, MIN_FORWARD_SPEED, MAX_SPEED))
+    right = int(clamp(base + turn, MIN_FORWARD_SPEED, MAX_SPEED))
 
     return left, right, math.degrees(error)
 
 
-def choose_movement_command():
-    global current_target
+def maybe_start_unstick():
+    global unstick_until, unstick_dir
 
+    if time.time() < unstick_until:
+        return
+
+    if moved_recently_enough():
+        return
+
+    unstick_dir = random.choice([-1, 1])
+    unstick_until = time.time() + 1.7
+
+
+def unstick_command():
+    """
+    Strong forward curve, not spin.
+    """
+    if unstick_dir > 0:
+        return CRUISE_SPEED - 150, CRUISE_SPEED + 70, "unstick strong forward curve left"
+
+    return CRUISE_SPEED + 70, CRUISE_SPEED - 150, "unstick strong forward curve right"
+
+
+def choose_movement_command():
     pose = get_my_pose()
 
     if pose is None:
@@ -320,20 +489,17 @@ def choose_movement_command():
     safety_target, safety_reason = get_safety_target(pose)
 
     if safety_target is not None:
-        left, right, err = steer_to_target(pose, safety_target, AVOID_SPEED)
+        left, right, err = steer_to_target_forward_only(pose, safety_target, AVOID_SPEED)
         return left, right, safety_reason, safety_target, err
 
-    if current_target is None or time.time() > target_until:
-        choose_random_target()
+    maybe_start_unstick()
 
-    tx, ty = current_target
-    dist_to_target = math.sqrt((tx - pose[0]) ** 2 + (ty - pose[1]) ** 2)
+    if time.time() < unstick_until:
+        left, right, reason = unstick_command()
+        return left, right, reason, None, None
 
-    if dist_to_target < 0.12:
-        choose_random_target()
-
-    left, right, err = steer_to_target(pose, current_target, FORWARD_SPEED)
-    return left, right, "long random target", current_target, err
+    left, right, reason = free_drive_command()
+    return left, right, reason, None, None
 
 
 # ============================================================
@@ -341,10 +507,6 @@ def choose_movement_command():
 # ============================================================
 
 def send_hello_to_close_robots(client):
-    """
-    Every few seconds, look at latest robot_pos/all positions.
-    If another robot is within COMMUNICATION_RADIUS, send Hello to robot/<id>.
-    """
     global next_proximity_check, sent_count
 
     now = time.time()
@@ -412,10 +574,6 @@ def handle_robot_message(payload_text):
 
 
 def update_leds(pipuck):
-    """
-    Blink blue when a message has been received.
-    If LEDs fail for any reason, the program continues and just logs messages.
-    """
     global led_state, led_available
 
     if not led_available:
@@ -424,7 +582,6 @@ def update_leds(pipuck):
     now = time.time()
 
     if now < blink_until:
-        # Blink: blue/off/blue/off...
         desired = "blue" if int(now * 6) % 2 == 0 else "off"
     else:
         desired = "off"
@@ -477,15 +634,16 @@ def on_message(client, userdata, msg):
 def main():
     global last_print
 
-    print("Task 2: random walk + talk to close robots")
+    print("Task 2 confident: long straight random walk + talk to close robots")
     print("Robot ID:", ROBOT_ID)
     print("Own topic:", OWN_TOPIC)
     print("Position topic:", POSITION_TOPIC)
     print("Communication radius:", COMMUNICATION_RADIUS, "m")
     print("Broker:", BROKER, PORT)
-    print("If movement turns the wrong way, change TURN_SIGN from 1 to -1.")
+    print("Movement: mostly long straight lines, no spin-in-place steering")
+    print("If boundary avoidance turns the wrong way, change TURN_SIGN from 1 to -1.")
 
-    client = mqtt.Client(client_id="task2_robot_{}".format(ROBOT_ID))
+    client = mqtt.Client(client_id="task2_confident_robot_{}".format(ROBOT_ID))
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(BROKER, PORT, 60)
@@ -497,9 +655,12 @@ def main():
         pipuck.epuck.set_motor_speeds(0, 0)
         time.sleep(0.5)
 
-        choose_random_target()
+        choose_new_drive_mode()
 
         while True:
+            pose = get_my_pose()
+            update_motion_estimate(pose)
+
             left, right, reason, target, err = choose_movement_command()
             pipuck.epuck.set_motor_speeds(left, right)
 
@@ -509,8 +670,6 @@ def main():
             now = time.time()
 
             if now - last_print > 1.5:
-                pose = get_my_pose()
-
                 print(
                     "cmd=({}, {}) reason={} pose={} target={} err={} sent={} received={} ids={}".format(
                         left,
@@ -534,6 +693,7 @@ def main():
 
     finally:
         print("Stopping robot")
+
         try:
             pipuck.epuck.set_motor_speeds(0, 0)
         except Exception as e:
@@ -552,3 +712,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+PY
