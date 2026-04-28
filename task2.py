@@ -1,5 +1,3 @@
-cd ~/pi_puck_proj
-cat > task2_confident.py <<'PY'
 #!/usr/bin/env python3
 import json
 import math
@@ -23,7 +21,7 @@ ROBOT_ID = "33"
 OWN_TOPIC = "robot/{}".format(ROBOT_ID)
 
 # Task says e.g. 50 cm. Reduce to 0.30 if it spams too much.
-COMMUNICATION_RADIUS = 0.50
+COMMUNICATION_RADIUS = 0.30
 PROXIMITY_CHECK_INTERVAL = 2.0
 HELLO_COOLDOWN_SECONDS = 8.0
 
@@ -712,4 +710,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PY
