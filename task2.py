@@ -63,7 +63,7 @@ FORBIDDEN_WARN_BUFFER = 0.18
 FORBIDDEN_EMERGENCY_BUFFER = 0.04
 
 # More active robot collision avoidance.
-ROBOT_WARN_DISTANCE = 0.38
+ROBOT_WARN_DISTANCE = 0.18
 ROBOT_EMERGENCY_DISTANCE = 0.23
 
 # Look ahead in the current movement direction.
