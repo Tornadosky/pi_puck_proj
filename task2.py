@@ -1,5 +1,3 @@
-cd ~/pi_puck_proj
-cat > task2_talk_close.py <<'PY'
 #!/usr/bin/env python3
 import json
 import math
