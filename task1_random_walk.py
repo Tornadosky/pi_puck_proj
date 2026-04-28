@@ -8,326 +8,262 @@ import paho.mqtt.client as mqtt
 from pipuck.pipuck import PiPuck
 
 
-# =======================
-# Settings you may change
-# =======================
+# ======================
+# Basic configuration
+# ======================
 
 BROKER = "192.168.178.43"
 PORT = 1883
 POSITION_TOPIC = "robot_pos/all"
 
-# Your robot number
 ROBOT_ID = "33"
 
-# Arena bounds in the SAME coordinate units as the tracking dashboard / MQTT.
-# If the dashboard uses different min/max values, change these.
+# Arena bounds from your previous run
 ARENA_MIN_X = 0.0
 ARENA_MAX_X = 2.0
 ARENA_MIN_Y = 0.0
 ARENA_MAX_Y = 1.0
 
-WALL_MARGIN = 0.18
-ROBOT_AVOID_DISTANCE = 0.35
+# Smaller margins than before, so it does not avoid all the time
+WALL_MARGIN = 0.12
+ROBOT_AVOID_DISTANCE = 0.18
 
-# Optional static obstacles: add known obstacle coordinates here.
-# Example: STATIC_OBSTACLES = [("box", 0.75, 0.50)]
+# Add static obstacles here if you know their coordinates:
+# Example: STATIC_OBSTACLES = [("box", 0.8, 0.5)]
 STATIC_OBSTACLES = []
-STATIC_AVOID_DISTANCE = 0.30
+STATIC_AVOID_DISTANCE = 0.18
 
-# Keep speeds low while testing.
-BASE_SPEED = 250
-SLOW_SPEED = 170
-TURN_SPEED = 220
-MAX_SPEED = 350
+# Safe speeds
+FORWARD_SPEED = 260
+CURVE_INNER_SPEED = 160
+CURVE_OUTER_SPEED = 270
+BACK_SPEED = -180
+TURN_SPEED = 200
 
-# If the robot turns the wrong way while avoiding, change this to -1.
-TURN_SIGN = 1
+CONTROL_PERIOD = 0.1
 
-# Safety: robot will not move until it sees its own MQTT position.
-REQUIRE_POSITION_FOR_MOVEMENT = True
-
-CONTROL_PERIOD = 0.10
-RANDOM_CHANGE_MIN = 1.0
-RANDOM_CHANGE_MAX = 3.0
-
-
+latest_positions = {}
 latest_raw = {}
-latest_poses = {}
-last_message_time = 0.0
 last_print_time = 0.0
 
-random_left = BASE_SPEED
-random_right = BASE_SPEED
-next_random_change = 0.0
+mode = "stop"
+mode_until = 0.0
+turn_dir = 1
 
 
-def norm_id(robot_id):
-    s = str(robot_id).strip()
-    lower = s.lower()
-    for prefix in ["pi-puck", "pipuck", "robot/", "robot_", "robot"]:
-        if lower.startswith(prefix):
-            s = s[len(prefix):]
-            break
-    return s.strip()
+def robot_key(robot_id):
+    return str(robot_id).replace("pi-puck", "").replace("robot", "").strip()
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def get_xy_angle_from_record(record):
+    """
+    Simple parser for likely MQTT formats:
+      {"position": [x, y], "angle": a}
+      {"x": x, "y": y, "angle": a}
+      [x, y, angle]
+    """
 
+    if isinstance(record, list) or isinstance(record, tuple):
+        if len(record) >= 2:
+            x = float(record[0])
+            y = float(record[1])
+            angle = float(record[2]) if len(record) >= 3 else 0.0
+            return x, y, angle
 
-def to_float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    if isinstance(record, dict):
+        if "position" in record:
+            pos = record["position"]
 
+            if isinstance(pos, list) or isinstance(pos, tuple):
+                x = float(pos[0])
+                y = float(pos[1])
+            elif isinstance(pos, dict):
+                x = float(pos["x"])
+                y = float(pos["y"])
+            else:
+                return None
 
-def dict_get(d, keys):
-    if not isinstance(d, dict):
-        return None
+            angle = float(record.get("angle", record.get("theta", 0.0)))
+            return x, y, angle
 
-    lower_map = {}
-    for k, v in d.items():
-        lower_map[str(k).lower()] = v
-
-    for key in keys:
-        if key in d:
-            return d[key]
-        lk = key.lower()
-        if lk in lower_map:
-            return lower_map[lk]
+        if "x" in record and "y" in record:
+            x = float(record["x"])
+            y = float(record["y"])
+            angle = float(record.get("angle", record.get("theta", 0.0)))
+            return x, y, angle
 
     return None
 
 
-def normalize_angle(angle):
-    while angle > math.pi:
-        angle -= 2.0 * math.pi
-    while angle < -math.pi:
-        angle += 2.0 * math.pi
-    return angle
-
-
-def angle_to_rad(angle):
-    if angle is None:
-        return None
-
-    angle = to_float(angle)
-    if angle is None:
-        return None
-
-    # If it looks like degrees, convert to radians.
-    if abs(angle) > 2.0 * math.pi + 0.1:
-        angle = math.radians(angle)
-
-    return normalize_angle(angle)
-
-
-def parse_pose_value(value):
-    """
-    Accepts several possible MQTT formats:
-      [x, y, angle]
-      {"x": x, "y": y, "angle": angle}
-      {"position": [x, y], "angle": angle}
-      {"position": {"x": x, "y": y}, "angle": angle}
-    """
-    x = None
-    y = None
-    theta = None
-
-    if isinstance(value, (list, tuple)):
-        if len(value) >= 2:
-            x = to_float(value[0])
-            y = to_float(value[1])
-        if len(value) >= 3:
-            theta = angle_to_rad(value[2])
-
-    elif isinstance(value, dict):
-        x = to_float(dict_get(value, ["x", "X", "pos_x", "position_x", "cx"]))
-        y = to_float(dict_get(value, ["y", "Y", "pos_y", "position_y", "cy"]))
-        theta = angle_to_rad(dict_get(value, ["angle", "theta", "a", "orientation", "yaw"]))
-
-        pos_obj = dict_get(value, ["position", "pos", "pose", "center", "coordinates"])
-        if pos_obj is not None:
-            nested = parse_pose_value(pos_obj)
-            if nested is not None:
-                nx, ny, nt = nested
-                if x is None:
-                    x = nx
-                if y is None:
-                    y = ny
-                if theta is None:
-                    theta = nt
-
-        angle_obj = dict_get(value, ["rotation", "heading"])
-        if theta is None and angle_obj is not None:
-            theta = angle_to_rad(angle_obj)
-
-    if x is None or y is None:
-        return None
-
-    return (x, y, theta)
-
-
 def parse_positions(data):
     """
-    Converts MQTT payload into:
-      {"33": (x, y, theta), "34": (...)}
+    Simple parser for topic robot_pos/all.
+
+    Expected style:
+      {
+        "33": {"position": [x, y], "angle": angle},
+        "34": {"position": [x, y], "angle": angle}
+      }
+
+    Also supports:
+      {
+        "robots": [
+          {"id": "33", "position": [x, y], "angle": angle}
+        ]
+      }
     """
-    poses = {}
 
-    if isinstance(data, dict):
-        for field in ["robots", "robot_pos", "positions", "data"]:
-            sub = dict_get(data, [field])
-            if sub is not None and sub is not data:
-                poses.update(parse_positions(sub))
+    positions = {}
 
-        rid = dict_get(data, ["id", "robot_id", "robotId", "name"])
-        pose = parse_pose_value(data)
-        if rid is not None and pose is not None:
-            poses[norm_id(rid)] = pose
+    if not isinstance(data, dict):
+        return positions
 
-        for key, value in data.items():
-            if str(key).lower() in ["time", "timestamp", "frame", "robots", "robot_pos", "positions", "data"]:
+    # Case 1: {"robots": [{"id": "33", ...}, ...]}
+    if "robots" in data and isinstance(data["robots"], list):
+        for record in data["robots"]:
+            if not isinstance(record, dict):
                 continue
 
-            pose = parse_pose_value(value)
-            if pose is None:
-                continue
+            rid = record.get("id", record.get("robot_id"))
+            pose = get_xy_angle_from_record(record)
 
-            rid = key
-            if isinstance(value, dict):
-                inner_id = dict_get(value, ["id", "robot_id", "robotId", "name"])
-                if inner_id is not None:
-                    rid = inner_id
-
-            poses[norm_id(rid)] = pose
-
-    elif isinstance(data, list):
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-
-            rid = dict_get(item, ["id", "robot_id", "robotId", "name"])
-            pose = parse_pose_value(item)
             if rid is not None and pose is not None:
-                poses[norm_id(rid)] = pose
+                positions[robot_key(rid)] = pose
 
-    return poses
+        return positions
 
+    # Case 2: {"33": {"position": [x, y], "angle": a}, ...}
+    for rid, record in data.items():
+        pose = get_xy_angle_from_record(record)
 
-def add_repulsion(vec, x, y, ox, oy, avoid_distance):
-    dx = x - ox
-    dy = y - oy
-    dist = math.sqrt(dx * dx + dy * dy)
+        if pose is not None:
+            positions[robot_key(rid)] = pose
 
-    if dist < 0.001:
-        angle = random.uniform(-math.pi, math.pi)
-        dx = math.cos(angle)
-        dy = math.sin(angle)
-        dist = 1.0
-
-    if dist < avoid_distance:
-        strength = (avoid_distance - dist) / avoid_distance
-        vec[0] += (dx / dist) * strength
-        vec[1] += (dy / dist) * strength
+    return positions
 
 
-def get_avoidance_vector(my_pose):
-    x, y, _theta = my_pose
-    vec = [0.0, 0.0]
+def distance(p1, p2):
+    dx = p1[0] - p2[0]
+    dy = p1[1] - p2[1]
+    return math.sqrt(dx * dx + dy * dy)
 
-    # Avoid arena boundary.
-    if x < ARENA_MIN_X + WALL_MARGIN:
-        vec[0] += (ARENA_MIN_X + WALL_MARGIN - x) / WALL_MARGIN
 
-    if x > ARENA_MAX_X - WALL_MARGIN:
-        vec[0] -= (x - (ARENA_MAX_X - WALL_MARGIN)) / WALL_MARGIN
+def nearest_robot(my_pose):
+    nearest_id = None
+    nearest_dist = None
 
-    if y < ARENA_MIN_Y + WALL_MARGIN:
-        vec[1] += (ARENA_MIN_Y + WALL_MARGIN - y) / WALL_MARGIN
-
-    if y > ARENA_MAX_Y - WALL_MARGIN:
-        vec[1] -= (y - (ARENA_MAX_Y - WALL_MARGIN)) / WALL_MARGIN
-
-    # Avoid other robots using MQTT positions.
-    for other_id, other_pose in latest_poses.items():
-        if norm_id(other_id) == norm_id(ROBOT_ID):
+    for rid, pose in latest_positions.items():
+        if robot_key(rid) == robot_key(ROBOT_ID):
             continue
 
-        ox, oy, _ = other_pose
-        add_repulsion(vec, x, y, ox, oy, ROBOT_AVOID_DISTANCE)
+        d = distance(my_pose, pose)
 
-    # Avoid known static obstacles.
-    for _name, ox, oy in STATIC_OBSTACLES:
-        add_repulsion(vec, x, y, ox, oy, STATIC_AVOID_DISTANCE)
+        if nearest_dist is None or d < nearest_dist:
+            nearest_id = rid
+            nearest_dist = d
 
-    return vec
+    return nearest_id, nearest_dist
 
 
-def choose_random_speeds():
-    global random_left, random_right, next_random_change
+def danger_reason(my_pose):
+    x, y, _angle = my_pose
 
+    if x < ARENA_MIN_X + WALL_MARGIN:
+        return True, "left wall"
+
+    if x > ARENA_MAX_X - WALL_MARGIN:
+        return True, "right wall"
+
+    if y < ARENA_MIN_Y + WALL_MARGIN:
+        return True, "bottom wall"
+
+    if y > ARENA_MAX_Y - WALL_MARGIN:
+        return True, "top wall"
+
+    rid, d = nearest_robot(my_pose)
+    if d is not None and d < ROBOT_AVOID_DISTANCE:
+        return True, "robot {} too close: {:.3f}".format(rid, d)
+
+    for name, ox, oy in STATIC_OBSTACLES:
+        d = math.sqrt((x - ox) ** 2 + (y - oy) ** 2)
+        if d < STATIC_AVOID_DISTANCE:
+            return True, "static obstacle {} too close: {:.3f}".format(name, d)
+
+    return False, "clear"
+
+
+def choose_random_walk_mode():
+    global mode, mode_until, turn_dir
+
+    r = random.random()
     now = time.time()
 
-    if now >= next_random_change:
-        r = random.random()
+    if r < 0.65:
+        mode = "forward"
+        mode_until = now + random.uniform(1.0, 2.5)
 
-        if r < 0.60:
-            random_left = BASE_SPEED
-            random_right = BASE_SPEED
-        elif r < 0.80:
-            random_left = -TURN_SPEED
-            random_right = TURN_SPEED
-        else:
-            random_left = TURN_SPEED
-            random_right = -TURN_SPEED
+    elif r < 0.825:
+        mode = "curve_left"
+        mode_until = now + random.uniform(0.8, 1.8)
 
-        next_random_change = now + random.uniform(RANDOM_CHANGE_MIN, RANDOM_CHANGE_MAX)
-
-    return random_left, random_right
-
-
-def speeds_towards_angle(current_theta, target_theta):
-    if current_theta is None:
-        return -TURN_SPEED, TURN_SPEED
-
-    error = normalize_angle(target_theta - current_theta)
-    turn = TURN_SIGN * int(clamp(350.0 * error, -TURN_SPEED, TURN_SPEED))
-
-    if abs(error) > 1.0:
-        left = -turn
-        right = turn
     else:
-        left = SLOW_SPEED - turn
-        right = SLOW_SPEED + turn
-
-    left = int(clamp(left, -MAX_SPEED, MAX_SPEED))
-    right = int(clamp(right, -MAX_SPEED, MAX_SPEED))
-
-    return left, right
+        mode = "curve_right"
+        mode_until = now + random.uniform(0.8, 1.8)
 
 
-def choose_speeds():
-    my_pose = latest_poses.get(norm_id(ROBOT_ID))
+def start_avoidance():
+    global mode, mode_until, turn_dir
+
+    turn_dir = random.choice([-1, 1])
+    mode = "avoid_back"
+    mode_until = time.time() + 0.45
+
+
+def get_motor_command():
+    global mode, mode_until
+
+    now = time.time()
+    my_pose = latest_positions.get(robot_key(ROBOT_ID))
 
     if my_pose is None:
-        if REQUIRE_POSITION_FOR_MOVEMENT:
-            return 0, 0, "waiting for own MQTT position"
+        return 0, 0, "waiting for own position"
 
-        left, right = choose_random_speeds()
-        return left, right, "random walk, no position"
+    danger, reason = danger_reason(my_pose)
 
-    avoid_vec = get_avoidance_vector(my_pose)
-    avoid_strength = math.sqrt(avoid_vec[0] ** 2 + avoid_vec[1] ** 2)
+    # If danger appears, do a fixed maneuver instead of constantly recalculating.
+    if danger and not mode.startswith("avoid"):
+        start_avoidance()
 
-    if avoid_strength > 0.01:
-        target_theta = math.atan2(avoid_vec[1], avoid_vec[0])
-        left, right = speeds_towards_angle(my_pose[2], target_theta)
-        return left, right, "avoidance"
+    # Avoidance phase 1: reverse
+    if mode == "avoid_back":
+        if now >= mode_until:
+            mode = "avoid_turn"
+            mode_until = now + 0.55
 
-    left, right = choose_random_speeds()
-    return left, right, "random walk"
+        return BACK_SPEED, BACK_SPEED, "avoidance: backing away from " + reason
+
+    # Avoidance phase 2: turn briefly
+    if mode == "avoid_turn":
+        if now >= mode_until:
+            mode = "forward"
+            mode_until = now + 1.0
+
+        return -turn_dir * TURN_SPEED, turn_dir * TURN_SPEED, "avoidance: turning away"
+
+    # Normal random walk
+    if now >= mode_until:
+        choose_random_walk_mode()
+
+    if mode == "forward":
+        return FORWARD_SPEED, FORWARD_SPEED, "random walk: forward"
+
+    if mode == "curve_left":
+        return CURVE_INNER_SPEED, CURVE_OUTER_SPEED, "random walk: curve left"
+
+    if mode == "curve_right":
+        return CURVE_OUTER_SPEED, CURVE_INNER_SPEED, "random walk: curve right"
+
+    return 0, 0, "stop"
 
 
 def on_connect(client, userdata, flags, rc):
@@ -336,27 +272,26 @@ def on_connect(client, userdata, flags, rc):
 
 
 def on_message(client, userdata, msg):
-    global latest_raw, latest_poses, last_message_time
+    global latest_positions, latest_raw
 
     try:
         payload = msg.payload.decode("utf-8", "replace")
         data = json.loads(payload)
-    except Exception as e:
-        print("Invalid MQTT message:", e, msg.payload)
-        return
 
-    latest_raw = data
-    latest_poses = parse_positions(data)
-    last_message_time = time.time()
+        latest_raw = data
+        latest_positions = parse_positions(data)
+
+    except Exception as e:
+        print("Bad MQTT message:", e)
 
 
 def main():
     global last_print_time
 
-    print("Starting Task 1 random walk with avoidance")
+    print("Task 1 simple random walk")
     print("Robot ID:", ROBOT_ID)
-    print("MQTT:", BROKER, PORT, POSITION_TOPIC)
-    print("Arena:", ARENA_MIN_X, ARENA_MAX_X, ARENA_MIN_Y, ARENA_MAX_Y)
+    print("Broker:", BROKER)
+    print("Topic:", POSITION_TOPIC)
 
     client = mqtt.Client()
     client.on_connect = on_connect
@@ -370,19 +305,36 @@ def main():
         pipuck.epuck.set_motor_speeds(0, 0)
         time.sleep(0.5)
 
+        choose_random_walk_mode()
+
         while True:
-            left, right, reason = choose_speeds()
+            left, right, reason = get_motor_command()
             pipuck.epuck.set_motor_speeds(left, right)
 
             now = time.time()
             if now - last_print_time > 2.0:
-                my_pose = latest_poses.get(norm_id(ROBOT_ID))
-                print("cmd=({}, {}) reason={} my_pose={} all_ids={}".format(
-                    left, right, reason, my_pose, sorted(latest_poses.keys())
-                ))
+                my_pose = latest_positions.get(robot_key(ROBOT_ID))
 
-                if not latest_poses:
-                    print("Raw MQTT payload is empty/unparsed:", latest_raw)
+                nearest_id = None
+                nearest_dist = None
+                if my_pose is not None:
+                    nearest_id, nearest_dist = nearest_robot(my_pose)
+
+                print(
+                    "cmd=({}, {}) mode={} reason={} my_pose={} nearest={} dist={} all_ids={}".format(
+                        left,
+                        right,
+                        mode,
+                        reason,
+                        my_pose,
+                        nearest_id,
+                        nearest_dist,
+                        sorted(latest_positions.keys())
+                    )
+                )
+
+                if not latest_positions:
+                    print("No parsed positions. Raw MQTT:", latest_raw)
 
                 last_print_time = now
 
@@ -392,12 +344,8 @@ def main():
         print("\nCtrl+C received")
 
     finally:
-        print("Stopping motors")
-        try:
-            pipuck.epuck.set_motor_speeds(0, 0)
-        except Exception as e:
-            print("Could not stop motors:", e)
-
+        print("Stopping robot")
+        pipuck.epuck.set_motor_speeds(0, 0)
         client.loop_stop()
         client.disconnect()
         print("Done")
