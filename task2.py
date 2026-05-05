@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 import json
 import math
-import random
 import time
 
 import paho.mqtt.client as mqtt
 from pipuck.pipuck import PiPuck
+
+try:
+    from smbus2 import SMBus, i2c_msg
+    SMBUS_AVAILABLE = True
+except Exception:
+    SMBUS_AVAILABLE = False
 
 
 # ============================================================
@@ -37,10 +42,10 @@ ARENA_X_MAX = 1.95
 ARENA_Y_MIN = 0.05
 ARENA_Y_MAX = 0.95
 
-# Only avoid when ACTUALLY near the boundary.
-# No predictive boundary logic.
-BOUNDARY_TRIGGER = 0.14
-BOUNDARY_CRITICAL = 0.08
+# More aware than the previous straight-reactive version,
+# but not crazy sensitive.
+BOUNDARY_TRIGGER = 0.18
+BOUNDARY_CRITICAL = 0.10
 
 FORBIDDEN_ZONES = [
     # name, x_min, x_max, y_min, y_max
@@ -48,11 +53,12 @@ FORBIDDEN_ZONES = [
 ]
 
 # Small buffer around forbidden zone.
-FORBIDDEN_BUFFER = 0.06
+# Increase to 0.13 if it still enters the forbidden zone.
+FORBIDDEN_BUFFER = 0.10
 
-# Robot collision avoidance threshold.
-# Communication radius can be 50 cm, but collision avoidance should be much smaller.
-ROBOT_AVOID_DISTANCE = 0.18
+# Camera/MQTT-based robot avoidance.
+# IR handles very close physical objects, so this threshold stays moderate.
+ROBOT_AVOID_DISTANCE = 0.17
 ROBOT_CRITICAL_DISTANCE = 0.13
 
 SAFE_CENTER_X = 1.00
@@ -60,34 +66,182 @@ SAFE_CENTER_Y = 0.50
 
 
 # ============================================================
+# IR SENSOR CONFIG
+# ============================================================
+
+# e-puck proximity sensor rough layout:
+# ps0 front-right, ps1 right-front, ps2 right, ps3 rear-right,
+# ps4 rear-left, ps5 left, ps6 left-front, ps7 front-left.
+#
+# Values depend on lighting and calibration.
+# If it avoids too early, increase these.
+# If it touches robots before avoiding, decrease these.
+IR_FRONT_TRIGGER = 700
+IR_FRONT_CRITICAL = 1200
+
+IR_SIDE_TRIGGER = 900
+IR_SIDE_CRITICAL = 1400
+
+
+# ============================================================
 # MOVEMENT CONFIG
 # ============================================================
 
 # Normal behavior: straight.
-CRUISE_SPEED = 390
+CRUISE_SPEED = 380
 
-# Avoidance behavior: turn away, then straight escape.
-TURN_SPEED = 180
-MIN_TURN_TIME = 0.35
-MAX_TURN_TIME = 0.95
+# Danger behavior:
+# 1. optionally back up for very close IR/robot danger,
+# 2. rotate in place,
+# 3. drive straight away.
+TURN_SPEED = 185
+MIN_TURN_TIME = 0.40
+MAX_TURN_TIME = 1.10
 
 ESCAPE_SPEED = 330
-ESCAPE_TIME = 2.1
+ESCAPE_TIME = 2.20
 
-# Only backup for very close robot collisions, not for boundaries.
 BACK_SPEED = 180
-BACK_TIME = 0.25
+BACK_TIME = 0.30
 
-MAX_SPEED = 520
 CONTROL_PERIOD = 0.10
 
-# If it turns the wrong direction during avoidance, change this to -1.
+# If it rotates the wrong way, change this to -1.
 TURN_SIGN = 1
 
-# Fallback camera-heading conversion.
-# The actual turn decision mostly uses recent movement direction, not the marker angle.
+# Fallback heading conversion from camera marker angle.
 ANGLE_SIGN = -1
 HEADING_OFFSET_DEG = 95.0
+
+
+# ============================================================
+# LOW-LEVEL E-PUCK2 I2C FOR MOTORS + IR PROXIMITY
+# ============================================================
+
+class EPuck2DirectIO:
+    """
+    Direct e-puck2 I2C communication.
+
+    This is used so we can read the 8 IR proximity values.
+    It also sends the motor speeds in the same packet.
+    """
+
+    I2C_CHANNEL = 12
+    LEGACY_I2C_CHANNEL = 4
+    ROB_ADDR = 0x1F
+
+    ACTUATORS_SIZE = 20
+    SENSORS_SIZE = 47
+
+    def __init__(self):
+        self.available = False
+        self.bus = None
+        self.fail_count = 0
+        self.last_prox = None
+
+        if not SMBUS_AVAILABLE:
+            print("smbus2 is not available, IR fallback disabled")
+            return
+
+        try:
+            self.bus = SMBus(self.I2C_CHANNEL)
+            self.available = True
+            print("Direct e-puck2 I2C opened on bus", self.I2C_CHANNEL)
+            return
+        except Exception:
+            pass
+
+        try:
+            self.bus = SMBus(self.LEGACY_I2C_CHANNEL)
+            self.available = True
+            print("Direct e-puck2 I2C opened on legacy bus", self.LEGACY_I2C_CHANNEL)
+            return
+        except Exception as e:
+            print("Could not open direct e-puck2 I2C. IR disabled:", e)
+
+    @staticmethod
+    def _put_int16_le(buf, index, value):
+        value = int(max(-2000, min(2000, value)))
+        value &= 0xFFFF
+        buf[index] = value & 0xFF
+        buf[index + 1] = (value >> 8) & 0xFF
+
+    @staticmethod
+    def _checksum(buf, n):
+        c = 0
+        for i in range(n):
+            c ^= buf[i]
+        return c
+
+    def exchange(self, left_speed, right_speed):
+        """
+        Send motor speeds and read IR sensors.
+        Returns a list of 8 proximity values, or None on failure.
+        """
+        if not self.available:
+            return None
+
+        actuators = bytearray([0] * self.ACTUATORS_SIZE)
+
+        self._put_int16_le(actuators, 0, left_speed)
+        self._put_int16_le(actuators, 2, right_speed)
+
+        # byte 4: speaker
+        actuators[4] = 0
+
+        # byte 5: normal e-puck LEDs off
+        actuators[5] = 0
+
+        # bytes 6..17: RGB LEDs off
+        for i in range(6, 18):
+            actuators[i] = 0
+
+        # byte 18: settings
+        actuators[18] = 0
+
+        # byte 19: checksum
+        actuators[19] = self._checksum(actuators, self.ACTUATORS_SIZE - 1)
+
+        try:
+            write = i2c_msg.write(self.ROB_ADDR, actuators)
+            read = i2c_msg.read(self.ROB_ADDR, self.SENSORS_SIZE)
+            self.bus.i2c_rdwr(write, read)
+
+            data = list(read)
+
+            checksum = self._checksum(data, self.SENSORS_SIZE - 1)
+            if checksum != data[self.SENSORS_SIZE - 1]:
+                self.fail_count += 1
+                return None
+
+            prox = []
+            for i in range(8):
+                value = data[i * 2 + 1] * 256 + data[i * 2]
+                prox.append(value)
+
+            self.fail_count = 0
+            self.last_prox = prox
+            return prox
+
+        except Exception as e:
+            self.fail_count += 1
+
+            if self.fail_count == 1:
+                print("Direct I2C exchange failed:", e)
+
+            if self.fail_count > 8:
+                print("Too many direct I2C failures; disabling IR/direct motor mode")
+                self.available = False
+
+            return None
+
+    def stop(self):
+        if not self.available:
+            return
+
+        for _ in range(3):
+            self.exchange(0, 0)
+            time.sleep(0.05)
 
 
 # ============================================================
@@ -98,6 +252,8 @@ latest_positions = {}
 latest_raw = {}
 last_position_time = 0.0
 
+latest_ir = None
+
 motion_history = []
 
 phase = "straight"
@@ -105,7 +261,6 @@ phase_until = 0.0
 turn_dir = 1
 avoid_reason = ""
 avoid_started = 0.0
-avoid_vector = (0.0, 0.0)
 
 last_hello_sent = {}
 next_proximity_check = 0.0
@@ -220,6 +375,24 @@ def distance(p1, p2):
     return math.sqrt(dx * dx + dy * dy)
 
 
+def format_pose(pose):
+    if pose is None:
+        return "None"
+
+    return "({:.3f}, {:.3f}, {:.3f})".format(
+        float(pose[0]),
+        float(pose[1]),
+        float(pose[2]),
+    )
+
+
+def format_ir(ir):
+    if ir is None:
+        return "None"
+
+    return "[" + ", ".join(str(int(v)) for v in ir) + "]"
+
+
 def log_line(text):
     stamp = time.strftime("%H:%M:%S")
     line = "[{}] {}".format(stamp, text)
@@ -259,7 +432,7 @@ def update_motion_history(pose):
 def recent_motion_heading(pose):
     """
     Prefer actual recent movement direction.
-    This is more reliable for deciding which way to turn away from danger.
+    This is more reliable than only trusting the marker angle.
     """
     if pose is None or len(motion_history) < 2:
         return camera_heading(pose) if pose is not None else 0.0
@@ -313,43 +486,129 @@ def add_vector(vec, dx, dy, weight):
     vec[1] += weight * dy / length
 
 
-def detect_danger(pose):
-    """
-    Returns None if there is no real danger.
+def vector_to_turn_danger(vec, reason, critical=False, back_first=False):
+    mag = math.sqrt(vec[0] * vec[0] + vec[1] * vec[1])
 
-    Danger only triggers when:
-      - close to a boundary,
-      - close to/inside forbidden zone,
-      - very close to another robot.
+    if mag < 0.001:
+        return None
+
+    safe_heading = math.atan2(vec[1], vec[0])
+
+    pose = get_my_pose()
+    current = recent_motion_heading(pose)
+    error = norm_angle(safe_heading - current)
+
+    needs_turn = abs(error) > math.radians(25)
+    turn_time = clamp(abs(error) / math.pi * 1.15, MIN_TURN_TIME, MAX_TURN_TIME)
+
+    return {
+        "reason": reason,
+        "critical": critical,
+        "back_first": back_first,
+        "turn_dir": 1 if error > 0 else -1,
+        "turn_time": turn_time,
+        "needs_turn": needs_turn,
+    }
+
+
+def detect_ir_danger(ir):
     """
+    IR-based close obstacle avoidance.
+
+    ps0 front-right, ps1 right-front, ps2 right,
+    ps5 left, ps6 left-front, ps7 front-left.
+    """
+    if ir is None or len(ir) < 8:
+        return None
+
+    ps0, ps1, ps2, ps3, ps4, ps5, ps6, ps7 = ir[:8]
+
+    front = max(ps0, ps7, int(0.75 * ps1), int(0.75 * ps6))
+    left_side = max(ps5, ps6, ps7)
+    right_side = max(ps0, ps1, ps2)
+
+    front_triggered = front >= IR_FRONT_TRIGGER
+    side_triggered = max(left_side, right_side) >= IR_SIDE_TRIGGER
+
+    if not front_triggered and not side_triggered:
+        return None
+
+    left_strength = ps5 + ps6 + ps7
+    right_strength = ps0 + ps1 + ps2
+
+    # If obstacle is stronger on left, turn right.
+    # If obstacle is stronger on right, turn left.
+    if left_strength > right_strength:
+        chosen_turn_dir = -1
+    elif right_strength > left_strength:
+        chosen_turn_dir = 1
+    else:
+        chosen_turn_dir = 1
+
+    critical = (
+        front >= IR_FRONT_CRITICAL or
+        max(left_side, right_side) >= IR_SIDE_CRITICAL
+    )
+
+    reasons = []
+
+    if front_triggered:
+        reasons.append("IR front {}".format(front))
+
+    if left_side >= IR_SIDE_TRIGGER:
+        reasons.append("IR left {}".format(left_side))
+
+    if right_side >= IR_SIDE_TRIGGER:
+        reasons.append("IR right {}".format(right_side))
+
+    return {
+        "reason": ", ".join(reasons),
+        "critical": critical,
+        "back_first": front >= IR_FRONT_CRITICAL,
+        "turn_dir": chosen_turn_dir,
+        "turn_time": 0.75 if critical else 0.55,
+        "needs_turn": True,
+    }
+
+
+def detect_pose_danger(pose):
+    """
+    Camera/MQTT-based danger:
+      - boundary,
+      - forbidden zone,
+      - nearby robots.
+    """
+    if pose is None:
+        return None
+
     x, y, _angle = pose
 
     vec = [0.0, 0.0]
     reasons = []
     critical = False
-    robot_critical = False
+    back_first = False
 
     # ---------- Boundary ----------
     if x < ARENA_X_MIN + BOUNDARY_TRIGGER:
-        vec[0] += 1.8
+        vec[0] += 2.0
         reasons.append("left boundary")
         if x < ARENA_X_MIN + BOUNDARY_CRITICAL:
             critical = True
 
     if x > ARENA_X_MAX - BOUNDARY_TRIGGER:
-        vec[0] -= 1.8
+        vec[0] -= 2.0
         reasons.append("right boundary")
         if x > ARENA_X_MAX - BOUNDARY_CRITICAL:
             critical = True
 
     if y < ARENA_Y_MIN + BOUNDARY_TRIGGER:
-        vec[1] += 1.8
+        vec[1] += 2.0
         reasons.append("bottom boundary")
         if y < ARENA_Y_MIN + BOUNDARY_CRITICAL:
             critical = True
 
     if y > ARENA_Y_MAX - BOUNDARY_TRIGGER:
-        vec[1] -= 1.8
+        vec[1] -= 2.0
         reasons.append("top boundary")
         if y > ARENA_Y_MAX - BOUNDARY_CRITICAL:
             critical = True
@@ -359,15 +618,15 @@ def detect_danger(pose):
         name = zone[0]
 
         if inside_rect(x, y, zone, 0.0):
-            add_vector(vec, SAFE_CENTER_X - x, SAFE_CENTER_Y - y, 3.0)
+            add_vector(vec, SAFE_CENTER_X - x, SAFE_CENTER_Y - y, 3.5)
             reasons.append("inside forbidden zone: " + name)
             critical = True
 
         elif inside_rect(x, y, zone, FORBIDDEN_BUFFER):
-            add_vector(vec, SAFE_CENTER_X - x, SAFE_CENTER_Y - y, 2.0)
+            add_vector(vec, SAFE_CENTER_X - x, SAFE_CENTER_Y - y, 2.5)
             reasons.append("near forbidden zone: " + name)
 
-    # ---------- Robot collision ----------
+    # ---------- Camera/MQTT robot collision ----------
     closest_id = None
     closest_pose = None
     closest_d = None
@@ -390,38 +649,35 @@ def detect_danger(pose):
             dx = x - closest_pose[0]
             dy = y - closest_pose[1]
 
-            add_vector(vec, dx, dy, 2.4)
-            reasons.append("robot {} at {:.2f}m".format(closest_id, closest_d))
+            add_vector(vec, dx, dy, 2.8)
+            reasons.append("robot {} at {:.3f}m".format(closest_id, closest_d))
 
             if closest_d < ROBOT_CRITICAL_DISTANCE:
                 critical = True
-                robot_critical = True
+                back_first = True
 
-    mag = math.sqrt(vec[0] * vec[0] + vec[1] * vec[1])
-
-    if mag < 0.001:
+    if not reasons:
         return None
 
-    safe_heading = math.atan2(vec[1], vec[0])
-    current = recent_motion_heading(pose)
-    error = norm_angle(safe_heading - current)
+    return vector_to_turn_danger(
+        vec,
+        ", ".join(reasons),
+        critical=critical,
+        back_first=back_first,
+    )
 
-    # If the target direction is almost straight ahead, skip turning and just escape.
-    needs_turn = abs(error) > math.radians(30)
 
-    turn_time = clamp(abs(error) / math.pi * 1.1, MIN_TURN_TIME, MAX_TURN_TIME)
+def detect_danger(pose):
+    """
+    Priority:
+      1. IR close obstacle,
+      2. boundary / forbidden zone / MQTT robot position.
+    """
+    ir_danger = detect_ir_danger(latest_ir)
+    if ir_danger is not None:
+        return ir_danger
 
-    return {
-        "reason": ", ".join(reasons),
-        "critical": critical,
-        "robot_critical": robot_critical,
-        "safe_heading": safe_heading,
-        "heading_error": error,
-        "turn_dir": 1 if error > 0 else -1,
-        "turn_time": turn_time,
-        "needs_turn": needs_turn,
-        "vector": (vec[0], vec[1]),
-    }
+    return detect_pose_danger(pose)
 
 
 # ============================================================
@@ -429,23 +685,20 @@ def detect_danger(pose):
 # ============================================================
 
 def start_avoidance(danger):
-    global phase, phase_until, turn_dir, avoid_reason, avoid_started, avoid_vector
+    global phase, phase_until, turn_dir, avoid_reason, avoid_started
 
     now = time.time()
 
     avoid_reason = danger["reason"]
     avoid_started = now
-    avoid_vector = danger["vector"]
     turn_dir = danger["turn_dir"]
 
-    # Only back up for very close robot collision.
-    # Do NOT back up for boundaries, because backing can push it outside.
-    if danger["robot_critical"]:
+    if danger.get("back_first", False):
         phase = "back"
         phase_until = now + BACK_TIME
         return
 
-    if danger["needs_turn"]:
+    if danger.get("needs_turn", True):
         phase = "turn"
         phase_until = now + danger["turn_time"]
         return
@@ -454,7 +707,7 @@ def start_avoidance(danger):
     phase_until = now + ESCAPE_TIME
 
 
-def avoidance_command(pose):
+def avoidance_command():
     global phase, phase_until
 
     now = time.time()
@@ -462,17 +715,17 @@ def avoidance_command(pose):
     if phase == "straight":
         return None
 
-    # Safety limit: do not get stuck in avoidance forever.
-    if now - avoid_started > 4.5:
+    # Never stay in avoidance forever.
+    if now - avoid_started > 5.0:
         phase = "straight"
         return None
 
     if phase == "back":
         if now >= phase_until:
             phase = "turn"
-            phase_until = now + 0.45
+            phase_until = now + 0.55
         else:
-            return -BACK_SPEED, -BACK_SPEED, "back away: " + avoid_reason
+            return -BACK_SPEED, -BACK_SPEED, "IR/robot backup: " + avoid_reason
 
     if phase == "turn":
         if now >= phase_until:
@@ -480,7 +733,7 @@ def avoidance_command(pose):
             phase_until = now + ESCAPE_TIME
         else:
             signed = TURN_SIGN * turn_dir * TURN_SPEED
-            return -signed, signed, "turn away: " + avoid_reason
+            return -signed, signed, "rotate away: " + avoid_reason
 
     if phase == "escape":
         if now >= phase_until:
@@ -501,7 +754,12 @@ def choose_movement_command():
 
     update_motion_history(pose)
 
-    cmd = avoidance_command(pose)
+    # During escape, a new very close IR obstacle can interrupt.
+    ir_danger = detect_ir_danger(latest_ir)
+    if ir_danger is not None and ir_danger["critical"] and phase in ["straight", "escape"]:
+        start_avoidance(ir_danger)
+
+    cmd = avoidance_command()
     if cmd is not None:
         return cmd
 
@@ -510,12 +768,35 @@ def choose_movement_command():
     if danger is not None:
         start_avoidance(danger)
 
-        cmd = avoidance_command(pose)
+        cmd = avoidance_command()
         if cmd is not None:
             return cmd
 
-    # Main behavior: just go straight.
     return CRUISE_SPEED, CRUISE_SPEED, "straight"
+
+
+# ============================================================
+# MOTOR COMMAND / IR READ
+# ============================================================
+
+def send_motors_and_read_ir(pipuck, direct_io, left, right):
+    """
+    Prefer direct I2C, because it sends motors and reads IR in one exchange.
+    If that is not available, fall back to PiPuck motor API without IR.
+    """
+    if direct_io is not None and direct_io.available:
+        return direct_io.exchange(left, right)
+
+    pipuck.epuck.set_motor_speeds(left, right)
+    return None
+
+
+def stop_robot(pipuck, direct_io):
+    if direct_io is not None and direct_io.available:
+        direct_io.stop()
+        return
+
+    pipuck.epuck.set_motor_speeds(0, 0)
 
 
 # ============================================================
@@ -649,39 +930,45 @@ def on_message(client, userdata, msg):
 # ============================================================
 
 def main():
-    global last_print
+    global last_print, latest_ir
 
-    print("Task 2 straight-reactive")
+    print("Task 2 IR-safe")
     print("Robot ID:", ROBOT_ID)
     print("Own topic:", OWN_TOPIC)
     print("Position topic:", POSITION_TOPIC)
     print("Broker:", BROKER, PORT)
-    print("Behavior: straight unless actually close to boundary / forbidden zone / robot")
+    print("Behavior: straight; IR/boundary/forbidden danger -> rotate in place -> escape")
     print("Boundary trigger:", BOUNDARY_TRIGGER)
     print("Forbidden buffer:", FORBIDDEN_BUFFER)
-    print("Robot avoid distance:", ROBOT_AVOID_DISTANCE)
-    print("If it turns the wrong way during avoidance, set TURN_SIGN = -1.")
+    print("MQTT robot avoid distance:", ROBOT_AVOID_DISTANCE)
+    print("IR front trigger:", IR_FRONT_TRIGGER)
+    print("IR side trigger:", IR_SIDE_TRIGGER)
+    print("If avoidance rotates wrong way, set TURN_SIGN = -1.")
 
-    client = mqtt.Client(client_id="task2_straight_reactive_robot_{}".format(ROBOT_ID))
+    client = mqtt.Client(client_id="task2_ir_safe_robot_{}".format(ROBOT_ID))
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(BROKER, PORT, 60)
     client.loop_start()
 
     pipuck = PiPuck(epuck_version=2)
+    direct_io = EPuck2DirectIO()
 
     try:
-        pipuck.epuck.set_motor_speeds(0, 0)
+        stop_robot(pipuck, direct_io)
         time.sleep(0.5)
 
         while True:
-            # If tracking is lost, stop instead of blindly driving.
+            # If tracking is stale, stop instead of blindly driving.
             if last_position_time > 0 and time.time() - last_position_time > 2.0:
                 left, right, reason = 0, 0, "position stale, stopping"
             else:
                 left, right, reason = choose_movement_command()
 
-            pipuck.epuck.set_motor_speeds(left, right)
+            ir = send_motors_and_read_ir(pipuck, direct_io, left, right)
+
+            if ir is not None:
+                latest_ir = ir
 
             send_hello_to_close_robots(client)
             update_leds(pipuck)
@@ -692,12 +979,13 @@ def main():
                 pose = get_my_pose()
 
                 print(
-                    "cmd=({}, {}) phase={} reason={} pose={} sent={} received={} ids={}".format(
+                    "cmd=({}, {}) phase={} reason={} pose={} ir={} sent={} received={} ids={}".format(
                         left,
                         right,
                         phase,
                         reason,
-                        pose,
+                        format_pose(pose),
+                        format_ir(latest_ir),
                         sent_count,
                         received_count,
                         sorted(latest_positions.keys()),
@@ -715,7 +1003,7 @@ def main():
         print("Stopping robot")
 
         try:
-            pipuck.epuck.set_motor_speeds(0, 0)
+            stop_robot(pipuck, direct_io)
         except Exception as e:
             print("Could not stop motors:", e)
 
