@@ -13,10 +13,6 @@ except Exception:
     SMBUS_AVAILABLE = False
 
 
-# ============================================================
-# TASK 2 CONFIG
-# ============================================================
-
 BROKER = "192.168.178.43"
 PORT = 1883
 
@@ -37,95 +33,123 @@ BLINK_DURATION_SECONDS = 7.0
 # ARENA / DANGER CONFIG
 # ============================================================
 
-ARENA_X_MIN = 0.05
-ARENA_X_MAX = 1.95
-ARENA_Y_MIN = 0.05
-ARENA_Y_MAX = 0.95
+ARENA_X_MIN = 0.03
+ARENA_X_MAX = 1.97
+ARENA_Y_MIN = 0.03
+ARENA_Y_MAX = 0.97
 
-# More aware than the previous straight-reactive version,
-# but not crazy sensitive.
-BOUNDARY_TRIGGER = 0.18
-BOUNDARY_CRITICAL = 0.10
+BOUNDARY_TRIGGER = 0.20
+BOUNDARY_CRITICAL = 0.11
 
-FORBIDDEN_ZONES = [
-    # name, x_min, x_max, y_min, y_max
-    ("top_left_forbidden", 0.00, 0.25, 0.75, 1.00),
+# Approximate red zones from your screenshot.
+POLYGON_DANGER_ZONES = [
+    (
+        "right_red_zone",
+        [
+            (1.70, 0.00),
+            (2.00, 0.00),
+            (2.00, 0.39),
+            (1.95, 0.35),
+            (1.90, 0.34),
+            (1.84, 0.30),
+            (1.78, 0.29),
+            (1.73, 0.25),
+            (1.75, 0.20),
+            (1.78, 0.15),
+            (1.74, 0.08),
+            (1.66, 0.02),
+        ],
+    ),
+    (
+        "bottom_red_zone",
+        [
+            (0.00, 0.00),
+            (1.70, 0.00),
+            (1.62, 0.05),
+            (1.50, 0.09),
+            (1.25, 0.13),
+            (1.05, 0.09),
+            (0.95, 0.05),
+            (0.72, 0.04),
+            (0.62, 0.075),
+            (0.44, 0.085),
+            (0.30, 0.06),
+            (0.25, 0.11),
+            (0.14, 0.15),
+            (0.00, 0.08),
+        ],
+    ),
+    (
+        "left_red_zone",
+        [
+            (0.00, 0.00),
+            (0.26, 0.00),
+            (0.22, 0.07),
+            (0.14, 0.15),
+            (0.25, 0.33),
+            (0.14, 0.43),
+            (0.25, 0.52),
+            (0.13, 0.70),
+            (0.23, 0.87),
+            (0.00, 1.00),
+        ],
+    ),
 ]
 
-# Small buffer around forbidden zone.
-# Increase to 0.13 if it still enters the forbidden zone.
-FORBIDDEN_BUFFER = 0.10
+POLYGON_BUFFER = 0.055
+POLYGON_CRITICAL_BUFFER = 0.015
 
-# Camera/MQTT-based robot avoidance.
-# IR handles very close physical objects, so this threshold stays moderate.
-ROBOT_AVOID_DISTANCE = 0.17
-ROBOT_CRITICAL_DISTANCE = 0.13
+CIRCLE_OBSTACLES = [
+    ("yellow_circle", 0.89, 0.53, 0.13),
+]
+CIRCLE_BUFFER = 0.06
+
+ROBOT_AVOID_DISTANCE = 0.20
+ROBOT_CRITICAL_DISTANCE = 0.14
 
 SAFE_CENTER_X = 1.00
 SAFE_CENTER_Y = 0.50
 
 
 # ============================================================
-# IR SENSOR CONFIG
+# IR CONFIG
 # ============================================================
 
-# e-puck proximity sensor rough layout:
-# ps0 front-right, ps1 right-front, ps2 right, ps3 rear-right,
-# ps4 rear-left, ps5 left, ps6 left-front, ps7 front-left.
-#
-# Values depend on lighting and calibration.
-# If it avoids too early, increase these.
-# If it touches robots before avoiding, decrease these.
-IR_FRONT_TRIGGER = 700
-IR_FRONT_CRITICAL = 1200
-
-IR_SIDE_TRIGGER = 900
-IR_SIDE_CRITICAL = 1400
+# Your log had normal IR values around 40-130 and edge noise up to about 395.
+# These are lower than before, but still above normal noise.
+IR_FRONT_TRIGGER = 480
+IR_FRONT_CRITICAL = 800
+IR_SIDE_TRIGGER = 560
+IR_SIDE_CRITICAL = 900
 
 
 # ============================================================
 # MOVEMENT CONFIG
 # ============================================================
 
-# Normal behavior: straight.
-CRUISE_SPEED = 380
+CRUISE_SPEED = 350
 
-# Danger behavior:
-# 1. optionally back up for very close IR/robot danger,
-# 2. rotate in place,
-# 3. drive straight away.
-TURN_SPEED = 185
-MIN_TURN_TIME = 0.40
-MAX_TURN_TIME = 1.10
+TURN_SPEED = 190
+HEADING_OK_DEG = 25.0
+HEADING_EMERGENCY_OK_DEG = 18.0
+MAX_TURN_SECONDS = 4.5
 
-ESCAPE_SPEED = 330
-ESCAPE_TIME = 2.20
+ESCAPE_SPEED = 300
+ESCAPE_TIME = 1.25
 
-BACK_SPEED = 180
-BACK_TIME = 0.30
+BACK_SPEED = 170
+BACK_TIME = 0.28
 
 CONTROL_PERIOD = 0.10
 
-# If it rotates the wrong way, change this to -1.
+# If rotate-away goes the wrong direction, change this to -1.
 TURN_SIGN = 1
 
-# Fallback heading conversion from camera marker angle.
 ANGLE_SIGN = -1
 HEADING_OFFSET_DEG = 95.0
 
 
-# ============================================================
-# LOW-LEVEL E-PUCK2 I2C FOR MOTORS + IR PROXIMITY
-# ============================================================
-
 class EPuck2DirectIO:
-    """
-    Direct e-puck2 I2C communication.
-
-    This is used so we can read the 8 IR proximity values.
-    It also sends the motor speeds in the same packet.
-    """
-
     I2C_CHANNEL = 12
     LEGACY_I2C_CHANNEL = 4
     ROB_ADDR = 0x1F
@@ -140,24 +164,19 @@ class EPuck2DirectIO:
         self.last_prox = None
 
         if not SMBUS_AVAILABLE:
-            print("smbus2 is not available, IR fallback disabled")
+            print("smbus2 is not available; IR fallback disabled")
             return
 
-        try:
-            self.bus = SMBus(self.I2C_CHANNEL)
-            self.available = True
-            print("Direct e-puck2 I2C opened on bus", self.I2C_CHANNEL)
-            return
-        except Exception:
-            pass
+        for channel in [self.I2C_CHANNEL, self.LEGACY_I2C_CHANNEL]:
+            try:
+                self.bus = SMBus(channel)
+                self.available = True
+                print("Direct e-puck2 I2C opened on bus", channel)
+                return
+            except Exception:
+                pass
 
-        try:
-            self.bus = SMBus(self.LEGACY_I2C_CHANNEL)
-            self.available = True
-            print("Direct e-puck2 I2C opened on legacy bus", self.LEGACY_I2C_CHANNEL)
-            return
-        except Exception as e:
-            print("Could not open direct e-puck2 I2C. IR disabled:", e)
+        print("Could not open direct e-puck2 I2C; IR disabled")
 
     @staticmethod
     def _put_int16_le(buf, index, value):
@@ -174,32 +193,20 @@ class EPuck2DirectIO:
         return c
 
     def exchange(self, left_speed, right_speed):
-        """
-        Send motor speeds and read IR sensors.
-        Returns a list of 8 proximity values, or None on failure.
-        """
         if not self.available:
             return None
 
         actuators = bytearray([0] * self.ACTUATORS_SIZE)
-
         self._put_int16_le(actuators, 0, left_speed)
         self._put_int16_le(actuators, 2, right_speed)
 
-        # byte 4: speaker
         actuators[4] = 0
-
-        # byte 5: normal e-puck LEDs off
         actuators[5] = 0
 
-        # bytes 6..17: RGB LEDs off
         for i in range(6, 18):
             actuators[i] = 0
 
-        # byte 18: settings
         actuators[18] = 0
-
-        # byte 19: checksum
         actuators[19] = self._checksum(actuators, self.ACTUATORS_SIZE - 1)
 
         try:
@@ -216,8 +223,7 @@ class EPuck2DirectIO:
 
             prox = []
             for i in range(8):
-                value = data[i * 2 + 1] * 256 + data[i * 2]
-                prox.append(value)
+                prox.append(data[i * 2 + 1] * 256 + data[i * 2])
 
             self.fail_count = 0
             self.last_prox = prox
@@ -244,23 +250,18 @@ class EPuck2DirectIO:
             time.sleep(0.05)
 
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-
 latest_positions = {}
 latest_raw = {}
 last_position_time = 0.0
-
 latest_ir = None
-
-motion_history = []
 
 phase = "straight"
 phase_until = 0.0
+phase_started = 0.0
 turn_dir = 1
 avoid_reason = ""
-avoid_started = 0.0
+safe_heading = None
+critical_danger = False
 
 last_hello_sent = {}
 next_proximity_check = 0.0
@@ -273,10 +274,6 @@ last_print = 0.0
 sent_count = 0
 received_count = 0
 
-
-# ============================================================
-# BASIC HELPERS
-# ============================================================
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
@@ -375,6 +372,19 @@ def distance(p1, p2):
     return math.sqrt(dx * dx + dy * dy)
 
 
+def heading_from_marker(pose):
+    raw_angle_rad = raw_angle_to_rad(pose[2])
+    offset = math.radians(HEADING_OFFSET_DEG)
+    return norm_angle(ANGLE_SIGN * raw_angle_rad + offset)
+
+
+def heading_error_deg(pose):
+    if pose is None or safe_heading is None:
+        return None
+
+    return math.degrees(norm_angle(safe_heading - heading_from_marker(pose)))
+
+
 def format_pose(pose):
     if pose is None:
         return "None"
@@ -406,77 +416,63 @@ def log_line(text):
         print("Could not write log:", e)
 
 
-# ============================================================
-# HEADING / MOTION ESTIMATE
-# ============================================================
+def point_in_polygon(x, y, poly):
+    inside = False
+    j = len(poly) - 1
 
-def camera_heading(pose):
-    raw_angle_rad = raw_angle_to_rad(pose[2])
-    offset = math.radians(HEADING_OFFSET_DEG)
-    return norm_angle(ANGLE_SIGN * raw_angle_rad + offset)
+    for i in range(len(poly)):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
 
+        intersects = ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-12) + xi
+        )
 
-def update_motion_history(pose):
-    global motion_history
+        if intersects:
+            inside = not inside
 
-    if pose is None:
-        return
+        j = i
 
-    now = time.time()
-    x, y, _angle = pose
-
-    motion_history.append((now, x, y))
-    motion_history = [p for p in motion_history if now - p[0] <= 5.0]
+    return inside
 
 
-def recent_motion_heading(pose):
-    """
-    Prefer actual recent movement direction.
-    This is more reliable than only trusting the marker angle.
-    """
-    if pose is None or len(motion_history) < 2:
-        return camera_heading(pose) if pose is not None else 0.0
+def nearest_point_on_segment(px, py, ax, ay, bx, by):
+    abx = bx - ax
+    aby = by - ay
+    apx = px - ax
+    apy = py - ay
 
-    now = time.time()
-    x, y, _angle = pose
+    denom = abx * abx + aby * aby
 
-    old_sample = None
+    if denom <= 1e-12:
+        return ax, ay
 
-    for sample in motion_history:
-        t, sx, sy = sample
-        if now - t >= 0.8:
-            old_sample = sample
-            break
+    t = clamp((apx * abx + apy * aby) / denom, 0.0, 1.0)
 
-    if old_sample is None:
-        old_sample = motion_history[0]
-
-    _t, old_x, old_y = old_sample
-
-    dx = x - old_x
-    dy = y - old_y
-    d = math.sqrt(dx * dx + dy * dy)
-
-    if d > 0.025:
-        return math.atan2(dy, dx)
-
-    return camera_heading(pose)
+    return ax + t * abx, ay + t * aby
 
 
-# ============================================================
-# DANGER DETECTION
-# ============================================================
+def polygon_distance_and_vector(x, y, poly):
+    best_d = None
+    best_vec = (0.0, 0.0)
 
-def inside_rect(x, y, zone, buffer_amount):
-    _name, x_min, x_max, y_min, y_max = zone
+    for i in range(len(poly)):
+        ax, ay = poly[i]
+        bx, by = poly[(i + 1) % len(poly)]
 
-    return (
-        x_min - buffer_amount <= x <= x_max + buffer_amount and
-        y_min - buffer_amount <= y <= y_max + buffer_amount
-    )
+        qx, qy = nearest_point_on_segment(x, y, ax, ay, bx, by)
+        dx = x - qx
+        dy = y - qy
+        d = math.sqrt(dx * dx + dy * dy)
+
+        if best_d is None or d < best_d:
+            best_d = d
+            best_vec = (dx, dy)
+
+    return best_d, best_vec
 
 
-def add_vector(vec, dx, dy, weight):
+def add_unit(vec, dx, dy, weight):
     length = math.sqrt(dx * dx + dy * dy)
 
     if length < 0.0001:
@@ -486,64 +482,25 @@ def add_vector(vec, dx, dy, weight):
     vec[1] += weight * dy / length
 
 
-def vector_to_turn_danger(vec, reason, critical=False, back_first=False):
-    mag = math.sqrt(vec[0] * vec[0] + vec[1] * vec[1])
-
-    if mag < 0.001:
+def detect_ir_danger():
+    if latest_ir is None or len(latest_ir) < 8:
         return None
 
-    safe_heading = math.atan2(vec[1], vec[0])
-
-    pose = get_my_pose()
-    current = recent_motion_heading(pose)
-    error = norm_angle(safe_heading - current)
-
-    needs_turn = abs(error) > math.radians(25)
-    turn_time = clamp(abs(error) / math.pi * 1.15, MIN_TURN_TIME, MAX_TURN_TIME)
-
-    return {
-        "reason": reason,
-        "critical": critical,
-        "back_first": back_first,
-        "turn_dir": 1 if error > 0 else -1,
-        "turn_time": turn_time,
-        "needs_turn": needs_turn,
-    }
-
-
-def detect_ir_danger(ir):
-    """
-    IR-based close obstacle avoidance.
-
-    ps0 front-right, ps1 right-front, ps2 right,
-    ps5 left, ps6 left-front, ps7 front-left.
-    """
-    if ir is None or len(ir) < 8:
-        return None
-
-    ps0, ps1, ps2, ps3, ps4, ps5, ps6, ps7 = ir[:8]
+    ps0, ps1, ps2, ps3, ps4, ps5, ps6, ps7 = latest_ir[:8]
 
     front = max(ps0, ps7, int(0.75 * ps1), int(0.75 * ps6))
     left_side = max(ps5, ps6, ps7)
     right_side = max(ps0, ps1, ps2)
 
-    front_triggered = front >= IR_FRONT_TRIGGER
-    side_triggered = max(left_side, right_side) >= IR_SIDE_TRIGGER
-
-    if not front_triggered and not side_triggered:
+    if front < IR_FRONT_TRIGGER and max(left_side, right_side) < IR_SIDE_TRIGGER:
         return None
 
     left_strength = ps5 + ps6 + ps7
     right_strength = ps0 + ps1 + ps2
 
-    # If obstacle is stronger on left, turn right.
-    # If obstacle is stronger on right, turn left.
-    if left_strength > right_strength:
-        chosen_turn_dir = -1
-    elif right_strength > left_strength:
-        chosen_turn_dir = 1
-    else:
-        chosen_turn_dir = 1
+    # Obstacle stronger on left -> turn right.
+    # Obstacle stronger on right -> turn left.
+    chosen_turn_dir = -1 if left_strength > right_strength else 1
 
     critical = (
         front >= IR_FRONT_CRITICAL or
@@ -552,7 +509,7 @@ def detect_ir_danger(ir):
 
     reasons = []
 
-    if front_triggered:
+    if front >= IR_FRONT_TRIGGER:
         reasons.append("IR front {}".format(front))
 
     if left_side >= IR_SIDE_TRIGGER:
@@ -564,20 +521,14 @@ def detect_ir_danger(ir):
     return {
         "reason": ", ".join(reasons),
         "critical": critical,
-        "back_first": front >= IR_FRONT_CRITICAL,
+        "safe_heading": None,
         "turn_dir": chosen_turn_dir,
-        "turn_time": 0.75 if critical else 0.55,
-        "needs_turn": True,
+        "back_first": front >= IR_FRONT_CRITICAL,
+        "source": "ir",
     }
 
 
 def detect_pose_danger(pose):
-    """
-    Camera/MQTT-based danger:
-      - boundary,
-      - forbidden zone,
-      - nearby robots.
-    """
     if pose is None:
         return None
 
@@ -588,45 +539,81 @@ def detect_pose_danger(pose):
     critical = False
     back_first = False
 
-    # ---------- Boundary ----------
+    # Rectangular table boundary.
     if x < ARENA_X_MIN + BOUNDARY_TRIGGER:
-        vec[0] += 2.0
+        strength = (ARENA_X_MIN + BOUNDARY_TRIGGER - x) / BOUNDARY_TRIGGER
+        vec[0] += 2.5 * strength
         reasons.append("left boundary")
+
         if x < ARENA_X_MIN + BOUNDARY_CRITICAL:
             critical = True
 
     if x > ARENA_X_MAX - BOUNDARY_TRIGGER:
-        vec[0] -= 2.0
+        strength = (x - (ARENA_X_MAX - BOUNDARY_TRIGGER)) / BOUNDARY_TRIGGER
+        vec[0] -= 2.5 * strength
         reasons.append("right boundary")
+
         if x > ARENA_X_MAX - BOUNDARY_CRITICAL:
             critical = True
 
     if y < ARENA_Y_MIN + BOUNDARY_TRIGGER:
-        vec[1] += 2.0
+        strength = (ARENA_Y_MIN + BOUNDARY_TRIGGER - y) / BOUNDARY_TRIGGER
+        vec[1] += 2.5 * strength
         reasons.append("bottom boundary")
+
         if y < ARENA_Y_MIN + BOUNDARY_CRITICAL:
             critical = True
 
     if y > ARENA_Y_MAX - BOUNDARY_TRIGGER:
-        vec[1] -= 2.0
+        strength = (y - (ARENA_Y_MAX - BOUNDARY_TRIGGER)) / BOUNDARY_TRIGGER
+        vec[1] -= 2.5 * strength
         reasons.append("top boundary")
+
         if y > ARENA_Y_MAX - BOUNDARY_CRITICAL:
             critical = True
 
-    # ---------- Forbidden zone ----------
-    for zone in FORBIDDEN_ZONES:
-        name = zone[0]
+    # Red polygon zones.
+    for name, poly in POLYGON_DANGER_ZONES:
+        inside = point_in_polygon(x, y, poly)
+        dist_to_poly, away_vec = polygon_distance_and_vector(x, y, poly)
 
-        if inside_rect(x, y, zone, 0.0):
-            add_vector(vec, SAFE_CENTER_X - x, SAFE_CENTER_Y - y, 3.5)
-            reasons.append("inside forbidden zone: " + name)
+        if inside:
+            add_unit(vec, SAFE_CENTER_X - x, SAFE_CENTER_Y - y, 4.5)
+            reasons.append("inside {}".format(name))
             critical = True
 
-        elif inside_rect(x, y, zone, FORBIDDEN_BUFFER):
-            add_vector(vec, SAFE_CENTER_X - x, SAFE_CENTER_Y - y, 2.5)
-            reasons.append("near forbidden zone: " + name)
+        elif dist_to_poly is not None and dist_to_poly < POLYGON_BUFFER:
+            dx, dy = away_vec
 
-    # ---------- Camera/MQTT robot collision ----------
+            if math.sqrt(dx * dx + dy * dy) < 0.001:
+                dx, dy = SAFE_CENTER_X - x, SAFE_CENTER_Y - y
+
+            weight = 3.0 * (POLYGON_BUFFER - dist_to_poly) / POLYGON_BUFFER
+            add_unit(vec, dx, dy, 1.8 + weight)
+
+            reasons.append("near {} {:.3f}m".format(name, dist_to_poly))
+
+            if dist_to_poly < POLYGON_CRITICAL_BUFFER:
+                critical = True
+
+    # Yellow circle.
+    for name, cx, cy, radius in CIRCLE_OBSTACLES:
+        dx = x - cx
+        dy = y - cy
+        d = math.sqrt(dx * dx + dy * dy)
+        danger_d = radius + CIRCLE_BUFFER
+
+        if d < danger_d:
+            if d < 0.001:
+                dx, dy = SAFE_CENTER_X - cx, SAFE_CENTER_Y - cy
+
+            add_unit(vec, dx, dy, 3.0)
+            reasons.append("near {} {:.3f}m".format(name, d))
+
+            if d < radius + 0.015:
+                critical = True
+
+    # Other robots from MQTT.
     closest_id = None
     closest_pose = None
     closest_d = None
@@ -646,68 +633,75 @@ def detect_pose_danger(pose):
 
     if closest_pose is not None and closest_d is not None:
         if 0.001 < closest_d < ROBOT_AVOID_DISTANCE:
-            dx = x - closest_pose[0]
-            dy = y - closest_pose[1]
+            add_unit(vec, x - closest_pose[0], y - closest_pose[1], 3.0)
 
-            add_vector(vec, dx, dy, 2.8)
-            reasons.append("robot {} at {:.3f}m".format(closest_id, closest_d))
+            reasons.append("robot {} {:.3f}m".format(closest_id, closest_d))
 
             if closest_d < ROBOT_CRITICAL_DISTANCE:
                 critical = True
                 back_first = True
 
-    if not reasons:
+    mag = math.sqrt(vec[0] * vec[0] + vec[1] * vec[1])
+
+    if mag < 0.001:
         return None
 
-    return vector_to_turn_danger(
-        vec,
-        ", ".join(reasons),
-        critical=critical,
-        back_first=back_first,
-    )
+    sh = math.atan2(vec[1], vec[0])
+    current_heading = heading_from_marker(pose)
+    error = norm_angle(sh - current_heading)
+
+    return {
+        "reason": ", ".join(reasons),
+        "critical": critical,
+        "safe_heading": sh,
+        "turn_dir": 1 if error > 0 else -1,
+        "back_first": back_first,
+        "source": "pose",
+    }
 
 
 def detect_danger(pose):
-    """
-    Priority:
-      1. IR close obstacle,
-      2. boundary / forbidden zone / MQTT robot position.
-    """
-    ir_danger = detect_ir_danger(latest_ir)
-    if ir_danger is not None:
-        return ir_danger
+    ir = detect_ir_danger()
+
+    if ir is not None:
+        return ir
 
     return detect_pose_danger(pose)
 
 
-# ============================================================
-# MOVEMENT STATE MACHINE
-# ============================================================
-
 def start_avoidance(danger):
-    global phase, phase_until, turn_dir, avoid_reason, avoid_started
+    global phase, phase_until, phase_started
+    global turn_dir, avoid_reason, safe_heading, critical_danger
 
     now = time.time()
 
+    phase_started = now
     avoid_reason = danger["reason"]
-    avoid_started = now
-    turn_dir = danger["turn_dir"]
+    safe_heading = danger.get("safe_heading")
+    critical_danger = bool(danger.get("critical", False))
+    turn_dir = int(danger.get("turn_dir", 1))
 
     if danger.get("back_first", False):
         phase = "back"
         phase_until = now + BACK_TIME
         return
 
-    if danger.get("needs_turn", True):
-        phase = "turn"
-        phase_until = now + danger["turn_time"]
-        return
-
-    phase = "escape"
-    phase_until = now + ESCAPE_TIME
+    phase = "turn"
+    phase_until = now + MAX_TURN_SECONDS
 
 
-def avoidance_command():
+def heading_is_safe(pose):
+    if safe_heading is None:
+        return False
+
+    err = abs(norm_angle(safe_heading - heading_from_marker(pose)))
+
+    limit = HEADING_EMERGENCY_OK_DEG if critical_danger else HEADING_OK_DEG
+
+    return math.degrees(err) <= limit
+
+
+def avoidance_command(pose):
     global phase, phase_until
 
     now = time.time()
@@ -715,27 +709,43 @@ def avoidance_command():
     if phase == "straight":
         return None
 
-    # Never stay in avoidance forever.
-    if now - avoid_started > 5.0:
-        phase = "straight"
-        return None
-
     if phase == "back":
         if now >= phase_until:
             phase = "turn"
-            phase_until = now + 0.55
+            phase_until = now + MAX_TURN_SECONDS
         else:
-            return -BACK_SPEED, -BACK_SPEED, "IR/robot backup: " + avoid_reason
+            return -BACK_SPEED, -BACK_SPEED, "backup: " + avoid_reason
 
     if phase == "turn":
-        if now >= phase_until:
+        # Pose danger: keep rotating until the marker heading actually points inward.
+        if safe_heading is not None and heading_is_safe(pose):
             phase = "escape"
             phase_until = now + ESCAPE_TIME
+
+        # IR-only danger: fixed turn because IR has no global safe heading.
+        elif safe_heading is None and now - phase_started > 0.65:
+            phase = "escape"
+            phase_until = now + ESCAPE_TIME
+
+        elif now >= phase_until:
+            # Stop instead of driving off the table.
+            return 0, 0, "turn timeout, stopping: " + avoid_reason
+
         else:
             signed = TURN_SIGN * turn_dir * TURN_SPEED
-            return -signed, signed, "rotate away: " + avoid_reason
+            return -signed, signed, "rotate until safe: " + avoid_reason
 
     if phase == "escape":
+        # If still in pose danger and not heading safely, rotate more.
+        new_danger = detect_pose_danger(pose)
+
+        if new_danger is not None and new_danger.get("safe_heading") is not None:
+            new_error = abs(norm_angle(new_danger["safe_heading"] - heading_from_marker(pose)))
+
+            if math.degrees(new_error) > HEADING_OK_DEG:
+                start_avoidance(new_danger)
+                return avoidance_command(pose)
+
         if now >= phase_until:
             phase = "straight"
             return None
@@ -752,14 +762,8 @@ def choose_movement_command():
     if pose is None:
         return 0, 0, "waiting for own position"
 
-    update_motion_history(pose)
+    cmd = avoidance_command(pose)
 
-    # During escape, a new very close IR obstacle can interrupt.
-    ir_danger = detect_ir_danger(latest_ir)
-    if ir_danger is not None and ir_danger["critical"] and phase in ["straight", "escape"]:
-        start_avoidance(ir_danger)
-
-    cmd = avoidance_command()
     if cmd is not None:
         return cmd
 
@@ -768,40 +772,29 @@ def choose_movement_command():
     if danger is not None:
         start_avoidance(danger)
 
-        cmd = avoidance_command()
+        cmd = avoidance_command(pose)
+
         if cmd is not None:
             return cmd
 
     return CRUISE_SPEED, CRUISE_SPEED, "straight"
 
 
-# ============================================================
-# MOTOR COMMAND / IR READ
-# ============================================================
-
 def send_motors_and_read_ir(pipuck, direct_io, left, right):
-    """
-    Prefer direct I2C, because it sends motors and reads IR in one exchange.
-    If that is not available, fall back to PiPuck motor API without IR.
-    """
     if direct_io is not None and direct_io.available:
         return direct_io.exchange(left, right)
 
     pipuck.epuck.set_motor_speeds(left, right)
+
     return None
 
 
 def stop_robot(pipuck, direct_io):
     if direct_io is not None and direct_io.available:
         direct_io.stop()
-        return
+    else:
+        pipuck.epuck.set_motor_speeds(0, 0)
 
-    pipuck.epuck.set_motor_speeds(0, 0)
-
-
-# ============================================================
-# TASK 2 COMMUNICATION
-# ============================================================
 
 def send_hello_to_close_robots(client):
     global next_proximity_check, sent_count
@@ -844,6 +837,7 @@ def send_hello_to_close_robots(client):
             }
 
             client.publish(topic, json.dumps(payload))
+
             last_hello_sent[rid] = now
             sent_count += 1
 
@@ -894,10 +888,6 @@ def update_leds(pipuck):
         print("LED control failed, continuing without LEDs:", e)
 
 
-# ============================================================
-# MQTT CALLBACKS
-# ============================================================
-
 def on_connect(client, userdata, flags, rc):
     print("Connected with result code", rc)
 
@@ -925,27 +915,22 @@ def on_message(client, userdata, msg):
         handle_robot_message(payload_text)
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def main():
     global last_print, latest_ir
 
-    print("Task 2 IR-safe")
+    print("Task 2 boundary-locked safe")
     print("Robot ID:", ROBOT_ID)
     print("Own topic:", OWN_TOPIC)
     print("Position topic:", POSITION_TOPIC)
     print("Broker:", BROKER, PORT)
-    print("Behavior: straight; IR/boundary/forbidden danger -> rotate in place -> escape")
+    print("Behavior: straight; danger -> rotate until heading is safe -> escape")
     print("Boundary trigger:", BOUNDARY_TRIGGER)
-    print("Forbidden buffer:", FORBIDDEN_BUFFER)
+    print("Polygon buffer:", POLYGON_BUFFER)
     print("MQTT robot avoid distance:", ROBOT_AVOID_DISTANCE)
-    print("IR front trigger:", IR_FRONT_TRIGGER)
-    print("IR side trigger:", IR_SIDE_TRIGGER)
-    print("If avoidance rotates wrong way, set TURN_SIGN = -1.")
+    print("IR front/side triggers:", IR_FRONT_TRIGGER, IR_SIDE_TRIGGER)
+    print("If it rotates the wrong way, set TURN_SIGN = -1.")
 
-    client = mqtt.Client(client_id="task2_ir_safe_robot_{}".format(ROBOT_ID))
+    client = mqtt.Client(client_id="task2_boundary_locked_robot_{}".format(ROBOT_ID))
     client.on_connect = on_connect
     client.on_message = on_message
     client.connect(BROKER, PORT, 60)
@@ -959,7 +944,8 @@ def main():
         time.sleep(0.5)
 
         while True:
-            # If tracking is stale, stop instead of blindly driving.
+            pose = get_my_pose()
+
             if last_position_time > 0 and time.time() - last_position_time > 2.0:
                 left, right, reason = 0, 0, "position stale, stopping"
             else:
@@ -975,16 +961,17 @@ def main():
 
             now = time.time()
 
-            if now - last_print > 1.5:
-                pose = get_my_pose()
+            if now - last_print > 1.2:
+                err = heading_error_deg(pose)
 
                 print(
-                    "cmd=({}, {}) phase={} reason={} pose={} ir={} sent={} received={} ids={}".format(
+                    "cmd=({}, {}) phase={} reason={} pose={} err={} ir={} sent={} received={} ids={}".format(
                         left,
                         right,
                         phase,
                         reason,
                         format_pose(pose),
+                        None if err is None else round(err, 1),
                         format_ir(latest_ir),
                         sent_count,
                         received_count,
